@@ -39,12 +39,48 @@ import run_kimodo  # noqa: E402
 DEFAULT_MODEL = run_kimodo.DEFAULT_MODEL
 
 
-# Default R15 (no avatar scaling) ankle Y in world. HRP_REST_Y - foot-block
-# height (Foot is 0.4 stud tall, ankle attachment at top of foot block).
-# This is the world Y the R15 ankle joint sits at when feet are flush with
-# the floor — our ground target for the LT.posY shift.
-_DEFAULT_R15_HRP_REST_Y = 2.0
-_DEFAULT_R15_HRP_TO_ANKLE = 1.6  # HRP_REST_Y - ankle world Y at rest
+# Default target rig dimensions: the Rthro "Rig" in workspace (the user's
+# canonical playback rig). Numbers measured directly from the Studio
+# instance (workspace.Rig) via MCP inspect. Stock R15 numbers are kept in
+# the dict below for reference / for users who want to override.
+#
+#   HumanoidRootPart.Position.Y  = 4.1197 stud (HRP rest world Y)
+#   LeftAnkleRigAttachment.WorldPosition.Y = 0.4505 stud
+#   ⇒ HRP-to-ankle = 4.1197 - 0.4505 = 3.6692 stud
+#
+# Foot block bottom Y = 0.0069 stud (≈ floor); ankle is 0.4436 stud above
+# foot bottom. So `target_rest_ankle_y = HRP_REST_Y - HRP_TO_ANKLE` ≈ 0.45,
+# which is what we want as the rest-pose anchor for grounding.
+_RTHRO_HRP_REST_Y = 4.1197
+_RTHRO_HRP_TO_ANKLE = 3.6693
+
+# Stock R15 (no avatar scaling) for reference: HRP_REST_Y = 2.0, HRP-to-
+# ankle = 1.6. Pass these via --target-hrp-rest-y / --target-hrp-to-ankle
+# if retargeting onto stock R15 instead of the Rthro Rig.
+_STOCK_R15_HRP_REST_Y = 2.0
+_STOCK_R15_HRP_TO_ANKLE = 1.6
+
+_DEFAULT_TARGET_HRP_REST_Y = _RTHRO_HRP_REST_Y
+_DEFAULT_TARGET_HRP_TO_ANKLE = _RTHRO_HRP_TO_ANKLE
+
+
+def _soma_bind_hip_to_ankle_studs() -> float:
+    """Hip-to-ankle Y of the soma bind BVH, in studs.
+
+    Loaded at runtime so the geometric HRP_SCALE auto-derivation tracks
+    whatever bind file `pipeline.BIND_BVH` points at. Currently
+    `data/soma_tpose.bvh` ⇒ 88.11 cm = 2.643 stud.
+    """
+    export_r15.set_rig(parent_pipeline.RIG)
+    bind = export_r15._load_anim_any(parent_pipeline.BIND_BVH)
+    names = list(bind["names"])
+    bp = bind["world_pos"]
+    hi = names.index("Hips")
+    li = names.index("LeftFoot")
+    ri = names.index("RightFoot")
+    bind_hip_y = float(bp[0, hi, 1])
+    bind_ankle_y = min(float(bp[0, li, 1]), float(bp[0, ri, 1]))
+    return (bind_hip_y - bind_ankle_y) * export_r15.CM_TO_STUD
 
 
 def _ground_y(
@@ -52,8 +88,8 @@ def _ground_y(
     bvh_path: Path,
     mode: str,
     *,
-    target_hrp_rest_y: float = _DEFAULT_R15_HRP_REST_Y,
-    target_hrp_to_ankle: float = _DEFAULT_R15_HRP_TO_ANKLE,
+    target_hrp_rest_y: float = _DEFAULT_TARGET_HRP_REST_Y,
+    target_hrp_to_ankle: float = _DEFAULT_TARGET_HRP_TO_ANKLE,
     extra_bias: float = 0.0,
 ) -> float:
     """Shift LowerTorso.posY so the rig's feet sit on the floor.
@@ -92,11 +128,14 @@ def _ground_y(
     fine-tuning if the proportional model over- or under-shoots.
 
     `target_hrp_rest_y` / `target_hrp_to_ankle` describe the rig the
-    rbxm is played on — defaults are stock R15 (2.0 / 1.6). Pass the
-    matching values for Rthro/scaled rigs (e.g., a Rig with HRP-to-foot
-    = 4.11 stud and HRP-to-ankle = 3.67 stud needs both numbers swapped
-    in, otherwise crouch-style clips under-correct since the leg-chain
-    scale is proportional to `target_hrp_to_ankle`).
+    rbxm is played on. Defaults match the Rthro "Rig" in the user's
+    workspace (4.1197 / 3.6693, measured from the live Studio instance).
+    Pass `--target-hrp-rest-y 2.0 --target-hrp-to-ankle 1.6` for stock
+    R15. The leg-chain scale used per frame is proportional to
+    `target_hrp_to_ankle`, so the wrong target chain length both
+    over/under-corrects standing pose AND amplifies the error in
+    crouches (where soma_chain shrinks and the proportional model
+    multiplies any error in the rest ratio).
     """
     import numpy as np  # local: avoid hard dep if pipeline runs without
 
@@ -156,10 +195,11 @@ def _ground_y(
         bind_chain_studs = bind_chain_cm * export_r15.CM_TO_STUD
         soma_chain_studs = soma_chain_cm * export_r15.CM_TO_STUD
         # Target-rig leg chain (HRP→ankle) scaled proportionally to the
-        # BVH's per-frame chain. For default R15 this is 1.6 * (soma/bind);
-        # for an Rthro Rig (3.67) it's >2× as large, so a crouch frame
-        # with soma_chain at 50% of bind drops the ankle ~1 stud farther
-        # than default R15 — that's the "rethink" the crouch-walk needs.
+        # BVH's per-frame chain. For Rthro Rig (default 3.6693) this is
+        # 3.67 * (soma/bind); for stock R15 (1.6) override it's smaller.
+        # A crouch frame with soma_chain at 50% of bind drops the ankle
+        # by 0.5 * target_hrp_to_ankle below rest, so the right value
+        # here is critical for crouch grounding.
         r15_chain = soma_chain_studs * (target_hrp_to_ankle / bind_chain_studs)
 
         lt_y = np.asarray(pos_y[:F], dtype=float)
@@ -284,18 +324,21 @@ def main(argv: list[str] | None = None) -> int:
                         "places the hip at an arbitrary Y and the "
                         "character would otherwise float by ~0.1-0.2 studs.")
     p.add_argument("--target-hrp-rest-y", type=float,
-                   default=_DEFAULT_R15_HRP_REST_Y,
-                   help="Target rig's HumanoidRootPart world Y at rest "
-                        f"(default {_DEFAULT_R15_HRP_REST_Y} for stock R15). "
-                        "For Rthro/scaled rigs use the actual value — "
-                        "e.g., a Rig with HRP-to-foot = 4.11 stud needs "
-                        "4.11 here, otherwise grounding under-corrects.")
+                   default=_DEFAULT_TARGET_HRP_REST_Y,
+                   help="Target rig's HumanoidRootPart world Y at rest. "
+                        f"Default {_DEFAULT_TARGET_HRP_REST_Y} matches "
+                        "the Rthro Rig in workspace (measured directly). "
+                        "For stock R15 pass 2.0.")
     p.add_argument("--target-hrp-to-ankle", type=float,
-                   default=_DEFAULT_R15_HRP_TO_ANKLE,
-                   help="Target rig's HRP-to-ankle Y distance at rest "
-                        f"(default {_DEFAULT_R15_HRP_TO_ANKLE} for stock "
-                        "R15). Drives leg-chain scaling for grounding — "
-                        "matters most for crouch/bent-knee clips.")
+                   default=_DEFAULT_TARGET_HRP_TO_ANKLE,
+                   help="Target rig's HRP-to-ankle Y distance at rest. "
+                        f"Default {_DEFAULT_TARGET_HRP_TO_ANKLE} matches "
+                        "the Rthro Rig (HRP=4.1197 minus ankle "
+                        "attachment Y=0.4505). For stock R15 pass 1.6. "
+                        "Drives the proportional leg-chain model in "
+                        "grounding AND the geometric HRP_SCALE auto-"
+                        "derivation, so getting this number right is "
+                        "the single most important knob.")
     p.add_argument("--ground-y-bias", type=float, default=0.0,
                    help="Manual offset added in studs after the "
                         "proportional grounding model (positive raises "
@@ -303,12 +346,14 @@ def main(argv: list[str] | None = None) -> int:
                         "over-shoots on a specific clip.")
     p.add_argument("--hrp-scale", type=float, default=None,
                    help="Override the BVH-hip-XZ → target-rig-hip-XZ "
-                        "scale. Default: derived from --target-hrp-rest-y "
-                        "as (target_y / 2.0) * pipeline.HRP_SCALE so a "
-                        "stock R15 (2.0) keeps the calibrated 0.72 and a "
-                        "bigger rig scales up linearly. Pass an explicit "
-                        "value to fix foot sliding when neither default "
-                        "nor the proportional rule lines up.")
+                        "scale. Default: pure geometric leg-length ratio "
+                        "= target_hrp_to_ankle / soma_bind_hip_to_ankle "
+                        "(loaded from pipeline.BIND_BVH). For Rthro "
+                        "(3.6693 / 2.643) ≈ 1.388. The no-slide "
+                        "constraint is geometric: when a foot is "
+                        "planted, hip XZ velocity = leg_length × "
+                        "angular_velocity; same Motor6D rotations on "
+                        "both rigs ⇒ scale = leg ratio.")
     p.add_argument("--roblox-cli", type=str, default=None)
     p.add_argument("--skip", action="append", default=[],
                    choices=["kimodo", "retarget", "rbxm"],
@@ -361,21 +406,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[prompt_pipeline] skip stage B, using {r15_json}")
     else:
         # Auto-derive hrp_scale from target rig if user didn't override.
-        # The no-slide condition is geometric: when a leg is planted, hip
-        # XZ velocity = leg_length * angular_velocity. Same BVH rotations
-        # play on the target rig's longer/shorter leg, so:
-        #     hrp_scale = target_leg_length / soma_bind_leg_length
-        # We anchor on the empirical 0.72 (calibrated for stock R15 leg
-        # = 1.6) and scale linearly by target_hrp_to_ankle / 1.6 so that
-        # stock R15 stays at 0.72 (no behavior change) and an Rthro Rig
-        # at 3.67 lands at 0.72 * 3.67/1.6 ≈ 1.65. Earlier rev anchored
-        # on target_hrp_rest_y / 2.0 which gave 1.48 for Rthro and left
-        # ~10% residual forward slide.
+        # No-slide condition (planted-foot kinematics):
+        #     hip_velocity_world = leg_length × leg_angular_velocity
+        # Motor6D rotations are identical on any target rig, so the
+        # scale that preserves "feet stay planted" is purely geometric:
+        #     hrp_scale = target_HRP_to_ankle / soma_bind_HRP_to_ankle
+        # For Rthro Rig (default 3.6693) and current bind (2.643 stud)
+        # ⇒ 1.388. For stock R15 override (1.6) ⇒ 0.605. We override
+        # the historical 0.72 baseline (which was empirically tuned and
+        # over-translated stock R15 by ~19%) in favor of geometry.
         if args.hrp_scale is not None:
             effective_hrp_scale = float(args.hrp_scale)
         else:
-            effective_hrp_scale = parent_pipeline.HRP_SCALE * (
-                args.target_hrp_to_ankle / _DEFAULT_R15_HRP_TO_ANKLE
+            soma_bind_chain_studs = _soma_bind_hip_to_ankle_studs()
+            effective_hrp_scale = (
+                args.target_hrp_to_ankle / soma_bind_chain_studs
             )
         info = parent_pipeline._retarget_bvh_to_r15_json(
             bvh_path, r15_json,
