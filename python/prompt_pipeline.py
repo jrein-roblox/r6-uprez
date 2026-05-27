@@ -38,6 +38,39 @@ import run_kimodo  # noqa: E402
 DEFAULT_MODEL = run_kimodo.DEFAULT_MODEL
 
 
+def _ground_y(result: dict, mode: str) -> float:
+    """Subtract a baseline from the root-translation Y curve so the rest
+    pose lands on the floor instead of floating.
+
+    Without constraints anchoring the feet, Kimodo's BVH places the hip
+    at an arbitrary Y. After retarget+fold, that residual Y lives in
+    LowerTorso.posY (or root.posY if root-motion is on) and lifts the
+    whole character — R15's leg chain is parented to LowerTorso, so
+    every descendant inherits the offset.
+
+    `mode='first'` zeroes out frame 0 (good when frame 0 is a standing
+    rest); `mode='min'` zeroes the lowest frame (guarantees no ground
+    penetration but parks bobbing motions slightly elevated); `mode='off'`
+    skips the shift. Returns the offset that was subtracted.
+    """
+    if mode == "off":
+        return 0.0
+    target = result.get("root") if "root" in result else result.get("parts", {}).get("LowerTorso")
+    if not target or "posY" not in target or not target["posY"]:
+        return 0.0
+    pos_y = target["posY"]
+    if mode == "first":
+        offset = pos_y[0]
+    elif mode == "min":
+        offset = min(pos_y)
+    else:
+        raise ValueError(f"unknown ground-y-mode: {mode}")
+    if abs(offset) < 1e-9:
+        return 0.0
+    target["posY"] = [v - offset for v in pos_y]
+    return offset
+
+
 def _run_kimodo_promptonly(
     clip_dir: Path,
     *,
@@ -131,6 +164,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="Mark the output as a looping clip. Required for "
                         "--inertial-blend to take effect (mirrors the "
                         "parent pipeline's behavior).")
+    p.add_argument("--ground-y-mode", choices=["first", "min", "off"],
+                   default="first",
+                   help="Shift the root-translation Y curve so the rest "
+                        "pose sits on the floor. 'first' (default) zeroes "
+                        "frame 0; 'min' zeroes the lowest frame (no "
+                        "ground penetration); 'off' disables. Without "
+                        "constraints anchoring the feet, Kimodo's BVH "
+                        "places the hip at an arbitrary Y and the "
+                        "character would otherwise float by ~0.1-0.2 studs.")
     p.add_argument("--roblox-cli", type=str, default=None)
     p.add_argument("--skip", action="append", default=[],
                    choices=["kimodo", "retarget", "rbxm"],
@@ -194,6 +236,15 @@ def main(argv: list[str] | None = None) -> int:
             inertial_blend_frames=args.inertial_blend,
         )
         print(f"[prompt_pipeline] retarget OK: {info}")
+        # Ground the rest pose. Done as a post-pass on the dumped JSON
+        # to avoid threading a new arg through the parent pipeline's
+        # retarget helper.
+        result = json.loads(r15_json.read_text())
+        offset = _ground_y(result, args.ground_y_mode)
+        if offset != 0.0:
+            r15_json.write_text(json.dumps(result, separators=(",", ":")))
+            print(f"[prompt_pipeline] grounded Y by {offset:+.4f} studs "
+                  f"(mode={args.ground_y_mode})")
 
     # ---- Stage C: rbxm ----
     rbxm_path = clip_dir / "r15.rbxm"
