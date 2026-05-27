@@ -326,8 +326,15 @@ def _retarget_bvh_to_r15_json(
     loop_passes: int = 1,
     looped: bool = False,
     inertial_blend_frames: int = 0,
+    hrp_scale: float | None = None,
 ) -> dict:
-    """Run the SOMA→R15 retarget. Mirrors batch_retarget._process_one."""
+    """Run the SOMA→R15 retarget. Mirrors batch_retarget._process_one.
+
+    `hrp_scale` overrides the module-level HRP_SCALE for a single run
+    (None ⇒ use HRP_SCALE). Pass it when retargeting onto a non-stock
+    rig (e.g., Rthro) so the hip XZ stride matches the target rig's
+    leg length and feet stop sliding.
+    """
     import export_r15
 
     export_r15.set_rig(RIG)
@@ -339,8 +346,9 @@ def _retarget_bvh_to_r15_json(
         hardcoded_bind=True,
         stride=1,
     )
-    if HRP_SCALE != 1.0:
-        s = float(HRP_SCALE)
+    effective_hrp_scale = HRP_SCALE if hrp_scale is None else float(hrp_scale)
+    if effective_hrp_scale != 1.0:
+        s = float(effective_hrp_scale)
         root = result["root"]
         root["posX"] = [v * s for v in root["posX"]]
         root["posZ"] = [v * s for v in root["posZ"]]

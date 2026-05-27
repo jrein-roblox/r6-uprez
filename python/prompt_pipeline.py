@@ -32,39 +32,149 @@ REPO_ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
 import build_rbxm  # noqa: E402
+import export_r15  # noqa: E402
 import pipeline as parent_pipeline  # noqa: E402
 import run_kimodo  # noqa: E402
 
 DEFAULT_MODEL = run_kimodo.DEFAULT_MODEL
 
 
-def _ground_y(result: dict, mode: str) -> float:
-    """Subtract a baseline from the root-translation Y curve so the rest
-    pose lands on the floor instead of floating.
+# Default R15 (no avatar scaling) ankle Y in world. HRP_REST_Y - foot-block
+# height (Foot is 0.4 stud tall, ankle attachment at top of foot block).
+# This is the world Y the R15 ankle joint sits at when feet are flush with
+# the floor — our ground target for the LT.posY shift.
+_DEFAULT_R15_HRP_REST_Y = 2.0
+_DEFAULT_R15_HRP_TO_ANKLE = 1.6  # HRP_REST_Y - ankle world Y at rest
 
-    Without constraints anchoring the feet, Kimodo's BVH places the hip
-    at an arbitrary Y. After retarget+fold, that residual Y lives in
-    LowerTorso.posY (or root.posY if root-motion is on) and lifts the
-    whole character — R15's leg chain is parented to LowerTorso, so
-    every descendant inherits the offset.
 
-    `mode='first'` zeroes out frame 0 (good when frame 0 is a standing
-    rest); `mode='min'` zeroes the lowest frame (guarantees no ground
-    penetration but parks bobbing motions slightly elevated); `mode='off'`
-    skips the shift. Returns the offset that was subtracted.
+def _ground_y(
+    result: dict,
+    bvh_path: Path,
+    mode: str,
+    *,
+    target_hrp_rest_y: float = _DEFAULT_R15_HRP_REST_Y,
+    target_hrp_to_ankle: float = _DEFAULT_R15_HRP_TO_ANKLE,
+    extra_bias: float = 0.0,
+) -> float:
+    """Shift LowerTorso.posY so the rig's feet sit on the floor.
+
+    Why a post-pass instead of fixing it in retarget: the export_r15
+    anchor (`LT.posY = (bvh_hip_y - bind_pelvis_y) * cmToStud`) keeps the
+    R15 hip tracking the BVH hip 1:1, but ignores the actual leg-chain
+    Y projection. Two failure modes:
+
+      1. Wave-style clips: kimodo's frame-0 hip is slightly above bind
+         and the legs are near rest, so feet float by 1-2 inches.
+      2. Crouch-style clips: kimodo emits bent knees with a fixed-Y hip
+         (no pelvis drop), so the R15 leg chain compresses but the rig
+         doesn't lower — feet hover several inches above ground.
+
+    Strategy: use the BVH's already-FK'd ankle world positions to predict
+    the R15 ankle world Y per frame, then shift LT.posY by a single
+    constant so the anchor frame's foot lands on the ground.
+
+    Proportional model: at any frame the R15 hip-to-ankle Y projection
+    scales linearly with the BVH's, by the rest-pose ratio. Specifically:
+
+        soma_chain_cm[i] = bvh_hip_y[i] - bvh_ankle_y[i]
+        R15_chain[i]     = target_hrp_to_ankle * (soma_chain_cm[i]
+                                                   / soma_bind_chain_cm)
+        R15_ankle_y[i]   = target_hrp_rest_y + LT.posY[i] - R15_chain[i]
+
+    The soma_bind_chain term comes from the bind BVH at runtime, so the
+    only per-rig knobs are `target_hrp_rest_y` and `target_hrp_to_ankle`
+    (defaulted to stock R15 — see args).
+
+    Mode 'first' anchors at frame 0 (best when the prompt's first frame
+    is a standing/planted pose); 'min' anchors at the frame with the
+    lowest predicted ankle Y (no ground penetration); 'off' disables.
+    `extra_bias` is added in studs (positive raises the rig) for manual
+    fine-tuning if the proportional model over- or under-shoots.
+
+    `target_hrp_rest_y` / `target_hrp_to_ankle` describe the rig the
+    rbxm is played on — defaults are stock R15 (2.0 / 1.6). Pass the
+    matching values for Rthro/scaled rigs (e.g., a Rig with HRP-to-foot
+    = 4.11 stud and HRP-to-ankle = 3.67 stud needs both numbers swapped
+    in, otherwise crouch-style clips under-correct since the leg-chain
+    scale is proportional to `target_hrp_to_ankle`).
     """
-    if mode == "off":
+    import numpy as np  # local: avoid hard dep if pipeline runs without
+
+    if mode == "off" and extra_bias == 0.0:
         return 0.0
+
     target = result.get("root") if "root" in result else result.get("parts", {}).get("LowerTorso")
     if not target or "posY" not in target or not target["posY"]:
         return 0.0
+
     pos_y = target["posY"]
-    if mode == "first":
-        offset = pos_y[0]
-    elif mode == "min":
-        offset = min(pos_y)
+    n = len(pos_y)
+
+    if mode == "off":
+        offset = 0.0
     else:
-        raise ValueError(f"unknown ground-y-mode: {mode}")
+        # Load BVH world positions for hip + ankle joints (already FK'd
+        # by export_r15's BVH parser — same data the retarget consumed).
+        export_r15.set_rig(parent_pipeline.RIG)
+        anim = export_r15._load_anim_any(bvh_path)
+        bind = export_r15._load_anim_any(parent_pipeline.BIND_BVH)
+        names = list(anim["names"])
+        # Soma joint names: hip = 'Hips', ankle joints = 'LeftFoot',
+        # 'RightFoot' (BVH "Foot" is the ankle joint, with Toe descendants
+        # beneath it). Falls back gracefully on other rigs that name
+        # ankles differently.
+        hip_name   = "Hips"
+        l_ankle    = "LeftFoot"
+        r_ankle    = "RightFoot"
+        for nm in (hip_name, l_ankle, r_ankle):
+            if nm not in names:
+                print(f"[prompt_pipeline] _ground_y: BVH missing {nm}, "
+                      f"skipping grounding")
+                return 0.0
+
+        wp = anim["world_pos"]   # (F, J, 3) cm, BVH space
+        bp = bind["world_pos"]   # (1, J, 3) cm, bind frame
+        hi = names.index(hip_name)
+        li = names.index(l_ankle)
+        ri = names.index(r_ankle)
+
+        bind_chain_cm = float(bp[0, hi, 1] - min(bp[0, li, 1], bp[0, ri, 1]))
+        if bind_chain_cm <= 1e-3:
+            print(f"[prompt_pipeline] _ground_y: bind hip-to-ankle "
+                  f"({bind_chain_cm:.2f} cm) is too small, skipping")
+            return 0.0
+
+        # Per-frame predicted R15 ankle world Y, taking the lower of the
+        # two ankles (whichever is closer to the ground controls the
+        # visible float).
+        F = min(wp.shape[0], n)
+        soma_hip = wp[:F, hi, 1]
+        soma_lank = wp[:F, li, 1]
+        soma_rank = wp[:F, ri, 1]
+        soma_lower_ank = np.minimum(soma_lank, soma_rank)
+        soma_chain_cm = soma_hip - soma_lower_ank   # (F,)
+        bind_chain_studs = bind_chain_cm * export_r15.CM_TO_STUD
+        soma_chain_studs = soma_chain_cm * export_r15.CM_TO_STUD
+        # Target-rig leg chain (HRP→ankle) scaled proportionally to the
+        # BVH's per-frame chain. For default R15 this is 1.6 * (soma/bind);
+        # for an Rthro Rig (3.67) it's >2× as large, so a crouch frame
+        # with soma_chain at 50% of bind drops the ankle ~1 stud farther
+        # than default R15 — that's the "rethink" the crouch-walk needs.
+        r15_chain = soma_chain_studs * (target_hrp_to_ankle / bind_chain_studs)
+
+        lt_y = np.asarray(pos_y[:F], dtype=float)
+        target_rest_ankle_y = target_hrp_rest_y - target_hrp_to_ankle
+        predicted_ankle_y = target_hrp_rest_y + lt_y - r15_chain
+        floats = predicted_ankle_y - target_rest_ankle_y   # >0 = floats; <0 = penetrates
+
+        if mode == "first":
+            offset = float(floats[0])
+        elif mode == "min":
+            offset = float(floats.min())
+        else:
+            raise ValueError(f"unknown ground-y-mode: {mode}")
+
+    offset -= extra_bias  # +bias raises character → less subtracted
     if abs(offset) < 1e-9:
         return 0.0
     target["posY"] = [v - offset for v in pos_y]
@@ -173,6 +283,32 @@ def main(argv: list[str] | None = None) -> int:
                         "constraints anchoring the feet, Kimodo's BVH "
                         "places the hip at an arbitrary Y and the "
                         "character would otherwise float by ~0.1-0.2 studs.")
+    p.add_argument("--target-hrp-rest-y", type=float,
+                   default=_DEFAULT_R15_HRP_REST_Y,
+                   help="Target rig's HumanoidRootPart world Y at rest "
+                        f"(default {_DEFAULT_R15_HRP_REST_Y} for stock R15). "
+                        "For Rthro/scaled rigs use the actual value — "
+                        "e.g., a Rig with HRP-to-foot = 4.11 stud needs "
+                        "4.11 here, otherwise grounding under-corrects.")
+    p.add_argument("--target-hrp-to-ankle", type=float,
+                   default=_DEFAULT_R15_HRP_TO_ANKLE,
+                   help="Target rig's HRP-to-ankle Y distance at rest "
+                        f"(default {_DEFAULT_R15_HRP_TO_ANKLE} for stock "
+                        "R15). Drives leg-chain scaling for grounding — "
+                        "matters most for crouch/bent-knee clips.")
+    p.add_argument("--ground-y-bias", type=float, default=0.0,
+                   help="Manual offset added in studs after the "
+                        "proportional grounding model (positive raises "
+                        "the rig). Use to nudge if the model under- or "
+                        "over-shoots on a specific clip.")
+    p.add_argument("--hrp-scale", type=float, default=None,
+                   help="Override the BVH-hip-XZ → target-rig-hip-XZ "
+                        "scale. Default: derived from --target-hrp-rest-y "
+                        "as (target_y / 2.0) * pipeline.HRP_SCALE so a "
+                        "stock R15 (2.0) keeps the calibrated 0.72 and a "
+                        "bigger rig scales up linearly. Pass an explicit "
+                        "value to fix foot sliding when neither default "
+                        "nor the proportional rule lines up.")
     p.add_argument("--roblox-cli", type=str, default=None)
     p.add_argument("--skip", action="append", default=[],
                    choices=["kimodo", "retarget", "rbxm"],
@@ -224,6 +360,23 @@ def main(argv: list[str] | None = None) -> int:
     if "retarget" in args.skip and r15_json.is_file():
         print(f"[prompt_pipeline] skip stage B, using {r15_json}")
     else:
+        # Auto-derive hrp_scale from target rig if user didn't override.
+        # The no-slide condition is geometric: when a leg is planted, hip
+        # XZ velocity = leg_length * angular_velocity. Same BVH rotations
+        # play on the target rig's longer/shorter leg, so:
+        #     hrp_scale = target_leg_length / soma_bind_leg_length
+        # We anchor on the empirical 0.72 (calibrated for stock R15 leg
+        # = 1.6) and scale linearly by target_hrp_to_ankle / 1.6 so that
+        # stock R15 stays at 0.72 (no behavior change) and an Rthro Rig
+        # at 3.67 lands at 0.72 * 3.67/1.6 ≈ 1.65. Earlier rev anchored
+        # on target_hrp_rest_y / 2.0 which gave 1.48 for Rthro and left
+        # ~10% residual forward slide.
+        if args.hrp_scale is not None:
+            effective_hrp_scale = float(args.hrp_scale)
+        else:
+            effective_hrp_scale = parent_pipeline.HRP_SCALE * (
+                args.target_hrp_to_ankle / _DEFAULT_R15_HRP_TO_ANKLE
+            )
         info = parent_pipeline._retarget_bvh_to_r15_json(
             bvh_path, r15_json,
             root_motion=args.root_motion,
@@ -234,17 +387,25 @@ def main(argv: list[str] | None = None) -> int:
             loop_passes=1,
             looped=bool(args.looped),
             inertial_blend_frames=args.inertial_blend,
+            hrp_scale=effective_hrp_scale,
         )
-        print(f"[prompt_pipeline] retarget OK: {info}")
+        print(f"[prompt_pipeline] retarget OK (hrp_scale={effective_hrp_scale:.3f}): {info}")
         # Ground the rest pose. Done as a post-pass on the dumped JSON
         # to avoid threading a new arg through the parent pipeline's
         # retarget helper.
         result = json.loads(r15_json.read_text())
-        offset = _ground_y(result, args.ground_y_mode)
+        offset = _ground_y(
+            result, bvh_path, args.ground_y_mode,
+            target_hrp_rest_y=args.target_hrp_rest_y,
+            target_hrp_to_ankle=args.target_hrp_to_ankle,
+            extra_bias=args.ground_y_bias,
+        )
         if offset != 0.0:
             r15_json.write_text(json.dumps(result, separators=(",", ":")))
             print(f"[prompt_pipeline] grounded Y by {offset:+.4f} studs "
-                  f"(mode={args.ground_y_mode})")
+                  f"(mode={args.ground_y_mode}, "
+                  f"target HRP={args.target_hrp_rest_y:.2f}/"
+                  f"chain={args.target_hrp_to_ankle:.2f})")
 
     # ---- Stage C: rbxm ----
     rbxm_path = clip_dir / "r15.rbxm"
