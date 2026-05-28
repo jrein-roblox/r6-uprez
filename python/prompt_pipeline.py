@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -222,11 +223,14 @@ def _ground_y(
 
 
 # Default inertial-blend window used by --loop when the user doesn't pass
-# their own --inertial-blend. 6 frames at 30 fps is 0.2 s — wide enough
-# to absorb the residual seam mismatch left by pass-2 (the constraint
-# pulls frame 0 and F-1 toward the same pose but kimodo doesn't honor
-# it perfectly), narrow enough to not visibly mush the loop point.
-_LOOP_DEFAULT_INERTIAL_FRAMES = 6
+# their own --inertial-blend / --inertial-blend-seconds. 0.2 s is wide
+# enough to absorb the residual seam mismatch left by pass-2 (the
+# constraint pulls frame 0 and F-1 toward the same pose but kimodo
+# doesn't honor it perfectly), narrow enough to not visibly mush the
+# loop point.
+_LOOP_DEFAULT_INERTIAL_SECONDS = 0.2
+_KIMODO_FPS = 30
+_LOOP_DEFAULT_INERTIAL_FRAMES = int(round(_LOOP_DEFAULT_INERTIAL_SECONDS * _KIMODO_FPS))
 
 
 def _build_loop_constraints(
@@ -390,7 +394,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="Generated motion duration in seconds. Default 3.0.")
     p.add_argument("--model", type=str, default=DEFAULT_MODEL)
     p.add_argument("--diffusion-steps", type=int, default=100)
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None,
+                   help="Kimodo seed. Default: a fresh random int per run "
+                        "(printed so you can reproduce). Pass an explicit "
+                        "value to lock the result. Pass 1 and pass 2 share "
+                        "the seed when --loop is set.")
     p.add_argument("--cfg-type", choices=["nocfg", "regular", "separated"],
                    default="regular",
                    help="Kimodo CFG mode. 'regular' (default) uses a single "
@@ -416,7 +424,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="Fake inertial blend over the first N frames using "
                         "the clip's last frame as the 'previous' pose. Use "
                         "for prompts that should loop. Default 0 (off) "
-                        "since prompt motions aren't periodic by default.")
+                        "since prompt motions aren't periodic by default. "
+                        "Prefer --inertial-blend-seconds for readability; "
+                        "this flag stays for backwards compat.")
+    p.add_argument("--inertial-blend-seconds", type=float, default=None,
+                   help="Inertial-blend window in seconds (rounded to "
+                        f"frames at {_KIMODO_FPS} fps). Wins over "
+                        "--inertial-blend if both are set. --loop without "
+                        "either falls back to "
+                        f"{_LOOP_DEFAULT_INERTIAL_SECONDS:.2f}s "
+                        f"({_LOOP_DEFAULT_INERTIAL_FRAMES} frames).")
     p.add_argument("--looped", action="store_true",
                    help="Mark the output as a looping clip. Required for "
                         "--inertial-blend to take effect (mirrors the "
@@ -427,10 +444,11 @@ def main(argv: list[str] | None = None) -> int:
                         "pass 1 (default frame 0; see --loop-offset) "
                         "pinned at both frame 0 and frame F-1 of pass 2. "
                         "Forces the start and end pose to match. Implies "
-                        f"--looped and bumps --inertial-blend to "
-                        f"{_LOOP_DEFAULT_INERTIAL_FRAMES} (unless "
-                        "explicitly set) so the residual seam is "
-                        "smoothed. Doubles the kimodo wall-clock cost.")
+                        "--looped and applies an inertial blend at the "
+                        f"seam (default "
+                        f"{_LOOP_DEFAULT_INERTIAL_SECONDS:.2f}s; override "
+                        "with --inertial-blend-seconds). Doubles the "
+                        "kimodo wall-clock cost.")
     p.add_argument("--loop-offset", type=float, default=0.0,
                    help="Time in seconds into pass 1 to sample as the loop "
                         "pivot pose (default 0.0 = frame 0). Use a "
@@ -492,12 +510,32 @@ def main(argv: list[str] | None = None) -> int:
     clip_dir = out_dir / name
     clip_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve inertial-blend in frames. Seconds wins if both are passed.
+    if args.inertial_blend_seconds is not None:
+        args.inertial_blend = max(
+            0, int(round(args.inertial_blend_seconds * _KIMODO_FPS))
+        )
+
     # --loop implies --looped + a non-zero inertial blend (unless the
-    # user already passed --inertial-blend > 0).
+    # user already passed --inertial-blend / --inertial-blend-seconds > 0).
     if args.loop:
         args.looped = True
         if args.inertial_blend <= 0:
             args.inertial_blend = _LOOP_DEFAULT_INERTIAL_FRAMES
+        print(f"[prompt_pipeline] --loop inertial blend: "
+              f"{args.inertial_blend} frames "
+              f"({args.inertial_blend / _KIMODO_FPS:.3f}s)")
+
+    # Resolve the seed once so we can (a) log it for reproducibility and
+    # (b) share the same value between pass 1 and pass 2 under --loop.
+    # kimodo_gen's own default is fixed, so without this every run with
+    # the same prompt produces identical motion.
+    if args.seed is None:
+        args.seed = random.randrange(2**31 - 1)
+        print(f"[prompt_pipeline] seed: {args.seed} (random; pass --seed "
+              f"{args.seed} to reproduce)")
+    else:
+        print(f"[prompt_pipeline] seed: {args.seed} (explicit)")
 
     # ---- Stage A: Kimodo ----
     # Pass-1 BVH lives at <clip_dir>/generated_pass1.bvh when looping,
