@@ -221,6 +221,112 @@ def _ground_y(
     return offset
 
 
+# Default inertial-blend window used by --loop when the user doesn't pass
+# their own --inertial-blend. 6 frames at 30 fps is 0.2 s — wide enough
+# to absorb the residual seam mismatch left by pass-2 (the constraint
+# pulls frame 0 and F-1 toward the same pose but kimodo doesn't honor
+# it perfectly), narrow enough to not visibly mush the loop point.
+_LOOP_DEFAULT_INERTIAL_FRAMES = 6
+
+
+def _build_loop_constraints(
+    pass1_npz: Path,
+    n_frames: int,
+    *,
+    sample_frame: int = 0,
+) -> list[dict]:
+    """Read pass-1 NPZ at `sample_frame` and emit constraints pinning that
+    pose at both frame 0 and frame n_frames-1 of pass 2.
+
+    Forces a closed loop: pass 2 starts and ends in the same pose, so the
+    LowerTorso/Hips/limb curves all return to where they began. The
+    inertial-blend post-pass on retarget then smooths the residual seam.
+
+    All four end-effectors (LeftHand, RightHand, LeftFoot, RightFoot) are
+    constrained simultaneously — Kimodo's loss is per-effector world-
+    position, so locking one limb would leave the others free to drift to
+    a different pose at the loop point. We share the same
+    `local_joints_rot` (whole-body SOMASkeleton77 axis-angle from NPZ
+    `sample_frame`) and `root_positions` (NPZ same frame, with XZ zeroed
+    so pass 2 starts at origin regardless of where the character had
+    drifted in pass 1; Y is kept so vertical hip height is preserved)
+    across all four constraints; the only differing field is
+    `joint_names`, which selects which leaf the world-position loss is
+    measured against.
+
+    `sample_frame` defaults to 0 (the prompt's natural starting pose,
+    typically idle). Pass a non-zero value to skip past the idle ramp-in
+    and use a mid-motion frame as the loop pivot.
+
+    Source: kimodo's NPZ output (`<stem>.npz`) contains:
+      - local_rot_mats : (F, 77, 3, 3) parent-relative rotation matrices
+        in SOMASkeleton77, kimodo's native session skeleton
+      - root_positions : (F, 3) meters, kimodo space (Y-up, +Z forward)
+    Kimodo's constraint loader (`_convert_constraint_local_rots_to_skeleton`)
+    auto-converts 30↔77 to whatever the session skeleton needs, so passing
+    77 here is the lossless choice — the BVH-Euler-via-numpy round-trip
+    used in earlier drafts of this helper introduced a 90° X-axis flip
+    (BVH parent-frame convention != SOMASkeleton77's).
+    """
+    import numpy as np
+    from scipy.spatial.transform import Rotation as R
+
+    if not pass1_npz.is_file():
+        raise FileNotFoundError(
+            f"pass-1 NPZ missing: {pass1_npz}. kimodo_gen --bvh should "
+            f"emit both .bvh and .npz; check the kimodo log."
+        )
+
+    data = np.load(pass1_npz, allow_pickle=True)
+    local_rot_mats = data["local_rot_mats"]   # (F, 77, 3, 3)
+    root_positions = data["root_positions"]   # (F, 3) meters
+    F_pass1 = local_rot_mats.shape[0]
+    if F_pass1 < 1:
+        raise RuntimeError(f"pass-1 NPZ {pass1_npz} has no frames")
+
+    if not (0 <= sample_frame < F_pass1):
+        raise ValueError(
+            f"sample_frame {sample_frame} out of range [0, {F_pass1}) for "
+            f"pass-1 NPZ {pass1_npz}"
+        )
+
+    # `sample_frame` → axis-angle. scipy.Rotation.from_matrix accepts
+    # (N, 3, 3) and as_rotvec() returns axis*angle in radians — exactly
+    # the format kimodo expects.
+    sf_aa = R.from_matrix(local_rot_mats[sample_frame]).as_rotvec()   # (77, 3)
+    sf_root = root_positions[sample_frame].astype(np.float64).copy()  # (3,) meters
+    # Zero the horizontal offset so pass 2 starts at origin regardless
+    # of where the character had drifted in pass 1. Keep Y (hip height)
+    # — collapsing it would put the constraint pose with hips at the
+    # floor and kimodo would interpret that as "lie down".
+    sf_root[0] = 0.0
+    sf_root[2] = 0.0
+
+    # Pin same pose at frames [0, F-1].
+    T = 2
+    local_rots = np.tile(sf_aa[None, :, :], (T, 1, 1))     # (2, 77, 3)
+    root_pos_T = np.tile(sf_root[None, :], (T, 1))         # (2, 3)
+    smooth_root_2d = root_pos_T[:, [0, 2]].copy()          # (2, 2)
+    frame_indices = [0, int(n_frames) - 1]
+
+    constraints: list[dict] = []
+    for ctype, joint_name in (
+        ("left-foot",  "LeftFoot"),
+        ("right-foot", "RightFoot"),
+        ("left-hand",  "LeftHand"),
+        ("right-hand", "RightHand"),
+    ):
+        constraints.append({
+            "type": ctype,
+            "frame_indices": frame_indices,
+            "local_joints_rot": local_rots.tolist(),
+            "root_positions": root_pos_T.tolist(),
+            "smooth_root_2d": smooth_root_2d.tolist(),
+            "joint_names": [joint_name],
+        })
+    return constraints
+
+
 def _run_kimodo_promptonly(
     clip_dir: Path,
     *,
@@ -231,14 +337,15 @@ def _run_kimodo_promptonly(
     diffusion_steps: int,
     cfg_type: str,
     cfg_weight: list[float],
+    out_name: str = "generated",
     extra_args: list[str] | None = None,
 ) -> Path:
     """Variant of run_kimodo.run_kimodo that does not require pre-built
-    meta.json + constraints.json. Writes generated.bvh into clip_dir and
+    meta.json + constraints.json. Writes <out_name>.bvh into clip_dir and
     returns its path."""
     clip_dir.mkdir(parents=True, exist_ok=True)
     bin_path = run_kimodo.resolve_kimodo_gen()
-    out_stem = clip_dir / "generated"
+    out_stem = clip_dir / out_name
 
     cmd = [
         bin_path,
@@ -314,6 +421,25 @@ def main(argv: list[str] | None = None) -> int:
                    help="Mark the output as a looping clip. Required for "
                         "--inertial-blend to take effect (mirrors the "
                         "parent pipeline's behavior).")
+    p.add_argument("--loop", action="store_true",
+                   help="Two-pass loop synthesis: pass 1 generates from "
+                        "the prompt, pass 2 re-runs with a frame from "
+                        "pass 1 (default frame 0; see --loop-offset) "
+                        "pinned at both frame 0 and frame F-1 of pass 2. "
+                        "Forces the start and end pose to match. Implies "
+                        f"--looped and bumps --inertial-blend to "
+                        f"{_LOOP_DEFAULT_INERTIAL_FRAMES} (unless "
+                        "explicitly set) so the residual seam is "
+                        "smoothed. Doubles the kimodo wall-clock cost.")
+    p.add_argument("--loop-offset", type=float, default=0.0,
+                   help="Time in seconds into pass 1 to sample as the loop "
+                        "pivot pose (default 0.0 = frame 0). Use a "
+                        "non-zero value to skip past the idle ramp-in "
+                        "kimodo often produces and pin the loop on a "
+                        "mid-motion pose instead. Pass-1 root XZ at the "
+                        "sampled frame is zeroed so pass 2 starts at the "
+                        "origin regardless of how far the character had "
+                        "drifted by then.")
     p.add_argument("--ground-y-mode", choices=["first", "min", "off"],
                    default="first",
                    help="Shift the root-translation Y curve so the rest "
@@ -366,8 +492,19 @@ def main(argv: list[str] | None = None) -> int:
     clip_dir = out_dir / name
     clip_dir.mkdir(parents=True, exist_ok=True)
 
+    # --loop implies --looped + a non-zero inertial blend (unless the
+    # user already passed --inertial-blend > 0).
+    if args.loop:
+        args.looped = True
+        if args.inertial_blend <= 0:
+            args.inertial_blend = _LOOP_DEFAULT_INERTIAL_FRAMES
+
     # ---- Stage A: Kimodo ----
+    # Pass-1 BVH lives at <clip_dir>/generated_pass1.bvh when looping,
+    # at <clip_dir>/generated.bvh otherwise. The retarget always reads
+    # generated.bvh — for --loop, pass 2 is what populates it.
     bvh_path = clip_dir / "generated.bvh"
+    pass1_bvh = clip_dir / ("generated_pass1.bvh" if args.loop else "generated.bvh")
     if "kimodo" in args.skip and bvh_path.is_file():
         print(f"[prompt_pipeline] skip stage A, using {bvh_path}")
     else:
@@ -377,7 +514,10 @@ def main(argv: list[str] | None = None) -> int:
             cfg_weight = [args.cfg_text_weight, args.cfg_constraint_weight]
         else:  # nocfg
             cfg_weight = []
-        bvh_path = _run_kimodo_promptonly(
+
+        # Pass 1: prompt-only. Output named pass1 when looping so we keep
+        # the artifact for debugging side-by-side with pass 2.
+        pass1_out = _run_kimodo_promptonly(
             clip_dir,
             prompt=args.prompt,
             duration_s=args.duration,
@@ -386,19 +526,83 @@ def main(argv: list[str] | None = None) -> int:
             diffusion_steps=args.diffusion_steps,
             cfg_type=args.cfg_type,
             cfg_weight=cfg_weight,
+            out_name=("generated_pass1" if args.loop else "generated"),
         )
-        # Stash a meta.json for parity with the asset-id pipeline (helps
-        # downstream tooling / debugging).
-        (clip_dir / "meta.json").write_text(json.dumps({
-            "source": "prompt",
-            "prompt": args.prompt,
-            "duration_s": float(args.duration),
-            "kimodo_model": args.model,
-            "kimodo_seed": args.seed,
-            "kimodo_diffusion_steps": args.diffusion_steps,
-            "kimodo_cfg_type": args.cfg_type,
-            "looped": bool(args.looped),
-        }, indent=2))
+        pass1_bvh = pass1_out
+
+        if args.loop:
+            # Build full-body constraints from pass-1 frame 0 pinned at
+            # both endpoints, then re-run kimodo with --constraints.
+            # Source the pose from the NPZ (kimodo's native rotation-
+            # matrix output), not the BVH — BVH local rotations use a
+            # different parent-frame convention than SOMASkeleton77 and
+            # round-tripping through Euler→quat→axis-angle introduced a
+            # ~90° X-axis flip on the limbs.
+            n_frames = int(round(args.duration * 30))
+            pass1_npz = pass1_bvh.with_suffix(".npz")
+            sample_frame = int(round(args.loop_offset * 30))
+            constraints = _build_loop_constraints(
+                pass1_npz, n_frames=n_frames, sample_frame=sample_frame,
+            )
+            (clip_dir / "constraints.json").write_text(
+                json.dumps(constraints, indent=2)
+            )
+            # run_kimodo.run_kimodo() reads meta.json for duration_s, so
+            # write a minimal one here. The retarget downstream doesn't
+            # need it, but keep it honest for debugging.
+            (clip_dir / "meta.json").write_text(json.dumps({
+                "source": "prompt+loop",
+                "prompt": args.prompt,
+                "duration_s": float(args.duration),
+                "kimodo_model": args.model,
+                "kimodo_seed": args.seed,
+                "kimodo_diffusion_steps": args.diffusion_steps,
+                "kimodo_cfg_type": args.cfg_type,
+                "looped": True,
+                "loop_pass": 2,
+                "loop_pass1_bvh": str(pass1_bvh),
+                "loop_pass1_npz": str(pass1_npz),
+                "loop_offset_s": float(args.loop_offset),
+                "loop_sample_frame": int(sample_frame),
+            }, indent=2))
+            # Forward the same CFG settings to pass 2 as extra args
+            # (run_kimodo.run_kimodo doesn't expose cfg natively). Without
+            # this, pass 2 falls back to kimodo_gen's default CFG, the
+            # text guidance on the prompt drops, and kimodo settles into
+            # the trivial low-loss solution: barely move between two
+            # identical endpoints. Re-using pass-1's cfg keeps the prompt
+            # pulling motion through the middle of the clip.
+            pass2_cfg_args: list[str] = ["--cfg_type", args.cfg_type]
+            if cfg_weight:
+                pass2_cfg_args += ["--cfg_weight", *(str(w) for w in cfg_weight)]
+            print(f"[prompt_pipeline] --loop pass 2: re-running kimodo with "
+                  f"endpoint constraints from pass-1 frame {sample_frame} "
+                  f"(offset={args.loop_offset:.2f}s, "
+                  f"cfg={args.cfg_type}/{cfg_weight})")
+            run_kimodo.run_kimodo(
+                clip_dir,
+                prompt=args.prompt,
+                model=args.model,
+                seed=args.seed,
+                diffusion_steps=args.diffusion_steps,
+                out_name="generated",
+                extra_args=pass2_cfg_args,
+            )
+            bvh_path = clip_dir / "generated.bvh"
+        else:
+            bvh_path = pass1_out
+            # Stash a meta.json for parity with the asset-id pipeline
+            # (helps downstream tooling / debugging).
+            (clip_dir / "meta.json").write_text(json.dumps({
+                "source": "prompt",
+                "prompt": args.prompt,
+                "duration_s": float(args.duration),
+                "kimodo_model": args.model,
+                "kimodo_seed": args.seed,
+                "kimodo_diffusion_steps": args.diffusion_steps,
+                "kimodo_cfg_type": args.cfg_type,
+                "looped": bool(args.looped),
+            }, indent=2))
 
     # ---- Stage B: BVH → R15 JSON ----
     r15_json = clip_dir / "r15.json"
