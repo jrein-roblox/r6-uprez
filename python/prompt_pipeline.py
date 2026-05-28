@@ -313,7 +313,23 @@ def _build_loop_constraints(
     smooth_root_2d = root_pos_T[:, [0, 2]].copy()          # (2, 2)
     frame_indices = [0, int(n_frames) - 1]
 
-    constraints: list[dict] = []
+    # Lead with a Root2D constraint that directly pins root XZ at the
+    # endpoints. Effector constraints (below) only minimize per-leaf
+    # world position — they pull limbs into place but the root is free
+    # to drift sideways as long as the leaves stay put. Root2D adds an
+    # explicit penalty on the (x, z) trajectory at the same frames, so
+    # both passes start and end at the same world location even when
+    # the prompt asks for translation. `smooth_root_2d` is the pass-1
+    # root XZ at `sample_frame` after we zeroed it above, i.e. (0, 0)
+    # at both endpoints — pass 2 starts at the origin and returns to
+    # the origin so the loop closes cleanly.
+    constraints: list[dict] = [
+        {
+            "type": "root2d",
+            "frame_indices": frame_indices,
+            "smooth_root_2d": smooth_root_2d.tolist(),
+        },
+    ]
     for ctype, joint_name in (
         ("left-foot",  "LeftFoot"),
         ("right-foot", "RightFoot"),
@@ -449,6 +465,14 @@ def main(argv: list[str] | None = None) -> int:
                         f"{_LOOP_DEFAULT_INERTIAL_SECONDS:.2f}s; override "
                         "with --inertial-blend-seconds). Doubles the "
                         "kimodo wall-clock cost.")
+    p.add_argument("--loop-cfg-constraint-weight", type=float, default=4.0,
+                   help="When --loop is set, pass 2 is forced to "
+                        "cfg_type=separated with this constraint weight "
+                        "(text weight reuses --cfg-weight). Higher = pass 2 "
+                        "honors the start/end pose pin more strictly. "
+                        "Default 4.0; the kimodo default for separated "
+                        "constraint weight is 2.0. Pass 0 to fall back to "
+                        "the user's --cfg-type and skip the override.")
     p.add_argument("--loop-offset", type=float, default=0.0,
                    help="Time in seconds into pass 1 to sample as the loop "
                         "pivot pose (default 0.0 = frame 0). Use a "
@@ -602,21 +626,45 @@ def main(argv: list[str] | None = None) -> int:
                 "loop_pass1_npz": str(pass1_npz),
                 "loop_offset_s": float(args.loop_offset),
                 "loop_sample_frame": int(sample_frame),
+                "loop_cfg_constraint_weight": float(
+                    args.loop_cfg_constraint_weight
+                ),
             }, indent=2))
-            # Forward the same CFG settings to pass 2 as extra args
-            # (run_kimodo.run_kimodo doesn't expose cfg natively). Without
-            # this, pass 2 falls back to kimodo_gen's default CFG, the
-            # text guidance on the prompt drops, and kimodo settles into
-            # the trivial low-loss solution: barely move between two
-            # identical endpoints. Re-using pass-1's cfg keeps the prompt
-            # pulling motion through the middle of the clip.
-            pass2_cfg_args: list[str] = ["--cfg_type", args.cfg_type]
-            if cfg_weight:
-                pass2_cfg_args += ["--cfg_weight", *(str(w) for w in cfg_weight)]
+            # Forward CFG settings to pass 2 as extra args (run_kimodo.
+            # run_kimodo doesn't expose cfg natively). Without this, pass 2
+            # falls back to kimodo_gen's default CFG, the text guidance on
+            # the prompt drops, and kimodo settles into the trivial low-
+            # loss solution: barely move between two identical endpoints.
+            #
+            # When --loop-cfg-constraint-weight > 0 we force separated CFG
+            # so we can dial up the constraint pull independently of the
+            # text pull. cfg_type=regular has no constraint-weight knob —
+            # constraints are still honored via the loss but at kimodo's
+            # default scale, which is too soft for our endpoint pin (root
+            # and feet drift several cm at frame 0 / F-1). 'separated'
+            # exposes [text_weight, constraint_weight] and bumping the
+            # latter to ~4 (vs kimodo's default 2) tightens the seam by
+            # a factor of ~2 in our tests without visibly stiffening the
+            # middle of the clip.
+            if args.loop_cfg_constraint_weight > 0:
+                pass2_cfg_type = "separated"
+                pass2_cfg_weight = [
+                    float(args.cfg_weight),
+                    float(args.loop_cfg_constraint_weight),
+                ]
+            else:
+                pass2_cfg_type = args.cfg_type
+                pass2_cfg_weight = list(cfg_weight)
+            pass2_cfg_args: list[str] = ["--cfg_type", pass2_cfg_type]
+            if pass2_cfg_weight:
+                pass2_cfg_args += [
+                    "--cfg_weight",
+                    *(str(w) for w in pass2_cfg_weight),
+                ]
             print(f"[prompt_pipeline] --loop pass 2: re-running kimodo with "
                   f"endpoint constraints from pass-1 frame {sample_frame} "
                   f"(offset={args.loop_offset:.2f}s, "
-                  f"cfg={args.cfg_type}/{cfg_weight})")
+                  f"cfg={pass2_cfg_type}/{pass2_cfg_weight})")
             run_kimodo.run_kimodo(
                 clip_dir,
                 prompt=args.prompt,
