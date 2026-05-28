@@ -15,8 +15,15 @@ Stages:
     C. build_rbxm.py                                → work/<name>/r15.rbxm
 
 Usage:
+    # Single prompt
     uv run --with numpy --with scipy python/prompt_pipeline.py \
         --prompt "a person waves hello" --out work --name wave --duration 3.0
+
+    # Chained prompts (kimodo splits on '.'). Pass one duration per segment
+    # via a quoted, space-separated list:
+    uv run --with numpy --with scipy python/prompt_pipeline.py \
+        --prompt "a person waves hello. then they sit down." \
+        --duration "2.0 3.0" --out work --name wave-then-sit
 """
 from __future__ import annotations
 
@@ -347,22 +354,43 @@ def _build_loop_constraints(
     return constraints
 
 
+def _parse_durations(duration: str) -> list[float]:
+    """Split `--duration` into per-segment seconds.
+
+    Mirrors kimodo_gen's own parsing (`get_texts_and_num_frames_from_prompt`
+    in `kimodo/scripts/generate.py`): whitespace separator, each token a
+    float. Single token is allowed and reused per prompt by kimodo. The
+    pipeline only needs the list to compute the total clip length for
+    loop math; we leave per-segment validation to kimodo.
+    """
+    parts = duration.split()
+    if not parts:
+        raise ValueError("--duration must contain at least one number")
+    return [float(p) for p in parts]
+
+
 def _run_kimodo_promptonly(
     clip_dir: Path,
     *,
     prompt: str,
-    duration_s: float,
+    duration: str,
     model: str,
     seed: int | None,
     diffusion_steps: int,
     cfg_type: str,
     cfg_weight: list[float],
+    num_transition_frames: int,
     out_name: str = "generated",
     extra_args: list[str] | None = None,
 ) -> Path:
     """Variant of run_kimodo.run_kimodo that does not require pre-built
     meta.json + constraints.json. Writes <out_name>.bvh into clip_dir and
-    returns its path."""
+    returns its path.
+
+    `duration` is the raw kimodo-format string ("3.0" for one prompt or
+    "1.5 2.0 3.0" for chained prompts); we forward it verbatim so kimodo's
+    own multi-prompt splitter can validate length-vs-prompt-count.
+    """
     clip_dir.mkdir(parents=True, exist_ok=True)
     bin_path = run_kimodo.resolve_kimodo_gen()
     out_stem = clip_dir / out_name
@@ -371,10 +399,11 @@ def _run_kimodo_promptonly(
         bin_path,
         prompt,
         "--model", model,
-        "--duration", f"{duration_s}",
+        "--duration", duration,
         "--output", str(out_stem),
         "--bvh",
         "--diffusion_steps", str(diffusion_steps),
+        "--num_transition_frames", str(num_transition_frames),
         "--cfg_type", cfg_type,
     ]
     if cfg_weight:
@@ -384,7 +413,7 @@ def _run_kimodo_promptonly(
     if extra_args:
         cmd += list(extra_args)
 
-    print(f"[prompt_pipeline] kimodo_gen (prompt={prompt!r}, duration={duration_s}s)")
+    print(f"[prompt_pipeline] kimodo_gen (prompt={prompt!r}, duration={duration!r}s)")
     sys.stdout.flush()
     env = os.environ.copy()
     env.setdefault("HF_HUB_OFFLINE", "1")
@@ -406,8 +435,21 @@ def main(argv: list[str] | None = None) -> int:
                    help="Output directory. Final rbxm at <out>/<name>/r15.rbxm.")
     p.add_argument("--name", type=str, default=None,
                    help="Clip name (default: derived from --prompt).")
-    p.add_argument("--duration", type=float, default=3.0,
-                   help="Generated motion duration in seconds. Default 3.0.")
+    p.add_argument("--duration", type=str, default="3.0",
+                   help="Generated motion duration in seconds. Single number "
+                        "applies to every prompt segment (default 3.0). For "
+                        "chained prompts (separated by '.' in --prompt), "
+                        "pass a quoted space-separated list with one number "
+                        "per segment, e.g. --duration '1.5 2.0 3.0' for "
+                        "three prompts. Forwarded verbatim to kimodo_gen, "
+                        "which validates the count against the prompt.")
+    p.add_argument("--num-transition-frames", type=int, default=5,
+                   help="Cross-fade window between chained prompt segments "
+                        "(kimodo's --num_transition_frames). Default 5 "
+                        "frames matches kimodo's own default. Ignored when "
+                        "--prompt has only one segment. Higher = smoother "
+                        "blend between segments at the cost of less time in "
+                        "each pose.")
     p.add_argument("--model", type=str, default=DEFAULT_MODEL)
     p.add_argument("--diffusion-steps", type=int, default=100)
     p.add_argument("--seed", type=int, default=None,
@@ -534,6 +576,16 @@ def main(argv: list[str] | None = None) -> int:
     clip_dir = out_dir / name
     clip_dir.mkdir(parents=True, exist_ok=True)
 
+    # Parse --duration into per-segment seconds. Total = sum, used by all
+    # downstream frame-count math (loop endpoints, retarget bookkeeping,
+    # meta.json). The kimodo CLI re-parses the same string itself.
+    durations_per_segment = _parse_durations(args.duration)
+    total_duration_s = float(sum(durations_per_segment))
+    n_prompt_segments = len([s for s in args.prompt.split(".") if s.strip()])
+    print(f"[prompt_pipeline] duration: {args.duration!r} -> "
+          f"{durations_per_segment} ({total_duration_s:.3f}s total, "
+          f"{n_prompt_segments} prompt segment(s))")
+
     # Resolve inertial-blend in frames. Seconds wins if both are passed.
     if args.inertial_blend_seconds is not None:
         args.inertial_blend = max(
@@ -582,12 +634,13 @@ def main(argv: list[str] | None = None) -> int:
         pass1_out = _run_kimodo_promptonly(
             clip_dir,
             prompt=args.prompt,
-            duration_s=args.duration,
+            duration=args.duration,
             model=args.model,
             seed=args.seed,
             diffusion_steps=args.diffusion_steps,
             cfg_type=args.cfg_type,
             cfg_weight=cfg_weight,
+            num_transition_frames=args.num_transition_frames,
             out_name=("generated_pass1" if args.loop else "generated"),
         )
         pass1_bvh = pass1_out
@@ -600,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
             # different parent-frame convention than SOMASkeleton77 and
             # round-tripping through Euler→quat→axis-angle introduced a
             # ~90° X-axis flip on the limbs.
-            n_frames = int(round(args.duration * 30))
+            n_frames = int(round(total_duration_s * 30))
             pass1_npz = pass1_bvh.with_suffix(".npz")
             sample_frame = int(round(args.loop_offset * 30))
             constraints = _build_loop_constraints(
@@ -615,10 +668,13 @@ def main(argv: list[str] | None = None) -> int:
             (clip_dir / "meta.json").write_text(json.dumps({
                 "source": "prompt+loop",
                 "prompt": args.prompt,
-                "duration_s": float(args.duration),
+                "duration": args.duration,
+                "duration_s": total_duration_s,
+                "duration_per_segment_s": durations_per_segment,
                 "kimodo_model": args.model,
                 "kimodo_seed": args.seed,
                 "kimodo_diffusion_steps": args.diffusion_steps,
+                "kimodo_num_transition_frames": int(args.num_transition_frames),
                 "kimodo_cfg_type": args.cfg_type,
                 "looped": True,
                 "loop_pass": 2,
@@ -655,7 +711,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 pass2_cfg_type = args.cfg_type
                 pass2_cfg_weight = list(cfg_weight)
-            pass2_cfg_args: list[str] = ["--cfg_type", pass2_cfg_type]
+            pass2_cfg_args: list[str] = [
+                "--cfg_type", pass2_cfg_type,
+                "--num_transition_frames", str(args.num_transition_frames),
+            ]
             if pass2_cfg_weight:
                 pass2_cfg_args += [
                     "--cfg_weight",
@@ -664,7 +723,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[prompt_pipeline] --loop pass 2: re-running kimodo with "
                   f"endpoint constraints from pass-1 frame {sample_frame} "
                   f"(offset={args.loop_offset:.2f}s, "
-                  f"cfg={pass2_cfg_type}/{pass2_cfg_weight})")
+                  f"cfg={pass2_cfg_type}/{pass2_cfg_weight}, "
+                  f"duration={args.duration!r})")
             run_kimodo.run_kimodo(
                 clip_dir,
                 prompt=args.prompt,
@@ -673,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
                 diffusion_steps=args.diffusion_steps,
                 out_name="generated",
                 extra_args=pass2_cfg_args,
+                duration_override=args.duration,
             )
             bvh_path = clip_dir / "generated.bvh"
         else:
@@ -682,10 +743,13 @@ def main(argv: list[str] | None = None) -> int:
             (clip_dir / "meta.json").write_text(json.dumps({
                 "source": "prompt",
                 "prompt": args.prompt,
-                "duration_s": float(args.duration),
+                "duration": args.duration,
+                "duration_s": total_duration_s,
+                "duration_per_segment_s": durations_per_segment,
                 "kimodo_model": args.model,
                 "kimodo_seed": args.seed,
                 "kimodo_diffusion_steps": args.diffusion_steps,
+                "kimodo_num_transition_frames": int(args.num_transition_frames),
                 "kimodo_cfg_type": args.cfg_type,
                 "looped": bool(args.looped),
             }, indent=2))
@@ -752,7 +816,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         "name": name,
         "prompt": args.prompt,
-        "duration_s": args.duration,
+        "duration": args.duration,
+        "duration_s": total_duration_s,
         "rbxm": str(rbxm_path),
     }, indent=2))
     return 0

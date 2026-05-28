@@ -56,6 +56,7 @@ def run_kimodo(
     out_name: str = "generated",
     constraints_name: str = "constraints.json",
     extra_args: list[str] | None = None,
+    duration_override: str | None = None,
 ) -> dict:
     clip_dir = Path(clip_dir)
     meta_path = clip_dir / "meta.json"
@@ -67,7 +68,17 @@ def run_kimodo(
 
     with meta_path.open() as f:
         meta = json.load(f)
-    duration_s = float(meta["duration_s"])
+    # `duration_override` (str) wins over meta — needed for multi-prompt
+    # generation where the kimodo CLI takes a space-separated list of
+    # per-segment seconds (e.g. "1.5 2.0 3.0") that doesn't fit a single
+    # float meta field. The total-seconds float in meta["duration_s"]
+    # remains the right thing for downstream tooling.
+    if duration_override is not None:
+        duration_arg = duration_override
+        duration_s = float(meta["duration_s"]) if "duration_s" in meta else 0.0
+    else:
+        duration_s = float(meta["duration_s"])
+        duration_arg = f"{duration_s}"
 
     out_stem = clip_dir / out_name
     bin_path = resolve_kimodo_gen()
@@ -76,7 +87,7 @@ def run_kimodo(
         bin_path,
         prompt,
         "--model", model,
-        "--duration", f"{duration_s}",
+        "--duration", duration_arg,
         "--constraints", str(constraints_path),
         "--output", str(out_stem),
         "--bvh",
