@@ -72,8 +72,90 @@ python3 python/pipeline.py --asset-id <id> --out work --name <name> \
 5. **Inertial blend at loop seam** (`_inertial_blend_loop_seam`, default 8 frames): for looped clips, fake an inertial blend over the first N frames using the clip's last frame as the "previous" pose. Position curves use `+offset * (1 - smoothstep(t))`. Rotation curves use SLERP-from-identity by `decay(t)` of the offset rotation, composed with the original frame's rotation. Hemisphere-aligns `last_q` to `first_q` before computing the offset to avoid long-arc paths. Walks every curve once afterwards (`_unroll`) negating any quat with a negative dot to its predecessor — keeps Roblox's RotationCurve interpolator on the short arc everywhere.
 
 ### Stage 5: rbxm (`python/build_rbxm.py` + `lua/build_rbxm.lua`)
-- `FileSystemService:WriteInstances` writes a `CurveAnimation` Instance with one Folder per part containing `RotationCurve` + (optional) `Vector3Curve`.
-- Skips the HumanoidRootPart folder when `data.root` is nil (i.e., when fold-root is on).
+- `FileSystemService:WriteInstances` writes a `CurveAnimation` Instance with one Folder per part containing **paired** `RotationCurve` + `Vector3Curve` (translation).
+- **R15 hierarchy nesting**: folders are parented in rig order — LowerTorso under HumanoidRootPart, UpperTorso under LowerTorso, Head + UpperArms under UpperTorso, etc. Done via `PART_PARENT` map + a two-pass build (materialize then reparent). Unknown joint names fall back to direct children of the CurveAnimation root.
+- **HumanoidRootPart folder always exists** (so child chains can hang off it) but only carries curves when `data.root` is non-nil. With root-motion fold on, HRP curves are skipped and Studio plays the rbxm at the spawn HRP pose.
+- **Translation+Rotation always emitted together**: there is a downstream retargeting bug where a folder with only one of the two curves is treated as missing the joint entirely. We synthesize an identity Vector3Curve (0,0,0) when the JSON only has rotation, and identity RotationCurve (0,0,0,1) when it only has translation.
+- **Embedded rig metadata**: `data/RigData.rbxm` is loaded once at startup via `FileSystemService:LoadInstances` and a `:Clone()` of every top-level instance is parented under each emitted CurveAnimation. The retarget runtime uses these instances to map curve names to live Motor6Ds; without them, downstream consumers like `AnimationClipProvider` have no way to resolve which joint a "LeftHand" folder drives.
+
+## Prompt pipeline (`python/prompt_pipeline.py`)
+
+Synthesize R15 motion from a text prompt — no source asset, no pose
+extraction, no Stage 2 constraint synthesis. Reuses Stages 4 + 5 of the
+asset-id pipeline (BVH→R15 retarget, rbxm build).
+
+```sh
+python3 python/prompt_pipeline.py --prompt "<text>" --out work --name <name> --duration <secs>
+```
+
+Outputs land in `work/<name>/`:
+- `generated.bvh` / `generated.npz` — Kimodo output
+- `meta.json` — bookkeeping (prompt, duration, seed, model, …)
+- `r15.json` — R15 retarget result
+- `r15.rbxm` — final CurveAnimation
+
+### Stages
+
+#### Stage A: Kimodo (`_run_kimodo_promptonly`)
+Direct invocation of `kimodo_gen` with no constraints in the single-pass case. CFG defaults to `regular` with weight 5.0. The seed defaults to a fresh random int per run (printed for reproducibility).
+
+#### Stage B: BVH → R15 (`pipeline._retarget_bvh_to_r15_json`)
+Same as the asset-id pipeline, with two prompt-specific knobs:
+- `--hrp-scale`: auto-derived from `target_hrp_to_ankle / soma_bind_hip_to_ankle`. For Rthro Rig (3.6693 stud) and the soma bind (2.643 stud) ⇒ ≈ 1.388. The historical 0.72 baseline (empirical, over-translated stock R15 by ~19%) was retired in favor of geometry.
+- `--ground-y-mode` (default `first`): post-pass that shifts `LowerTorso.posY` so the rig's feet sit on the floor at the chosen anchor frame. Uses a proportional leg-chain model `R15_chain[i] = target_hrp_to_ankle × (soma_chain[i] / soma_bind_chain)`. Modes: `first` (frame 0), `min` (no penetration), `off`. Manual nudge via `--ground-y-bias`.
+
+#### Stage C: rbxm
+Identical to the asset-id pipeline's Stage 5.
+
+### Two-pass loop synthesis (`--loop`)
+
+Forces the start and end pose to match so the clip can loop cleanly. Doubles the kimodo wall-clock cost.
+
+1. **Pass 1**: prompt-only generation → `generated_pass1.{bvh,npz}`.
+2. **`_build_loop_constraints`** reads pass-1 NPZ at `--loop-offset` (default `0.0` s = frame 0) and emits five constraints pinning that pose at frames `[0, F-1]`:
+   - `Root2D` — pins root XZ (zeroed, so pass 2 starts at the origin) at both endpoints.
+   - Four `EndEffector` constraints (LeftHand / RightHand / LeftFoot / RightFoot) — share `local_joints_rot` (whole-body SOMASkeleton77 axis-angle) + `root_positions` (Y kept, XZ zeroed). Without all four, kimodo's per-effector world-position loss leaves the un-pinned limbs free to drift to a different pose at the loop point.
+3. **Pass 2** re-runs kimodo with `--constraints constraints.json`. CFG is forced to `separated` so the constraint weight can be amplified independently of the text weight. Default `--loop-cfg-constraint-weight = 4.0` (kimodo default for separated constraint weight is 2.0). Pass 0 to skip the override and stay on the user's `--cfg-type`. The text weight reuses `--cfg-weight`.
+4. **Inertial blend** (default 0.2 s = 6 frames at 30 fps; override with `--inertial-blend-seconds`): applied to the pass-2 retarget output to smooth the residual seam mismatch — kimodo's loss pulls toward the constraint but doesn't honor it perfectly.
+
+Source frame for the loop pin: pass `--loop-offset 0.5` (seconds into pass 1) to skip past kimodo's idle ramp-in and pin on a mid-motion pose. Pass-1 root XZ at the sampled frame is zeroed regardless of how far the character had drifted by then.
+
+NPZ rotations not BVH: pass-1 pose is sourced from `local_rot_mats` (kimodo's native `(F, 77, 3, 3)` SOMASkeleton77) via `scipy.Rotation.as_rotvec`. BVH local rotations use a different parent-frame convention; round-tripping through Euler→quat→axis-angle introduced a ~90° X-axis flip on the limbs.
+
+### Multi-prompt (chained-segment generation)
+
+Kimodo's CLI supports chained prompts via `.`-separation in `--prompt` and a space-separated per-segment duration list in `--duration`:
+
+```
+--prompt "a person waves hello. then they sit down." --duration "2.0 3.0"
+```
+
+The pipeline parses `--duration` (`_parse_durations`) into per-segment seconds, sums for total clip length, and forwards the raw string verbatim to `kimodo_gen` (which validates count vs. prompt segments). Single-token durations apply to every segment (kimodo handles the broadcast).
+
+`--num-transition-frames` (default 5) controls the cross-fade window between segments. Higher = smoother blend at the cost of less time in each pose. Forwarded to both pass 1 and pass 2 (under `--loop`). Ignored for single-segment prompts.
+
+### Prompt-pipeline flags summary
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--prompt` | required | Text prompt; `.`-separated for chained segments. |
+| `--duration` | `"3.0"` | Seconds per segment. Single value or quoted space-separated list. |
+| `--num-transition-frames` | 5 | Cross-fade window (frames @ 30 fps) between chained segments. |
+| `--seed` | random | Random by default; logged for reproducibility. Pass 1 + pass 2 share. |
+| `--cfg-type` | `regular` | Kimodo CFG mode (`regular` / `separated` / `nocfg`). |
+| `--cfg-weight` | 5.0 | Prompt weight (also pass-2 text weight under `--loop`). |
+| `--cfg-text-weight` / `--cfg-constraint-weight` | 2.0 / 2.0 | Used only when `--cfg-type=separated`. |
+| `--root-motion` | off | When off, fold HRP into LowerTorso (HRP stays at spawn). |
+| `--inertial-blend` / `--inertial-blend-seconds` | 0 / — | Frames or seconds of seam smoothing. Seconds wins if both set. |
+| `--looped` | off | Mark output as looping (required for `--inertial-blend` to take effect). |
+| `--loop` | off | Two-pass loop synthesis (implies `--looped` + 0.2 s blend). |
+| `--loop-cfg-constraint-weight` | 4.0 | Pass-2 separated constraint weight; 0 disables the override. |
+| `--loop-offset` | 0.0 | Seconds into pass 1 to sample as the loop pivot pose. |
+| `--ground-y-mode` | `first` | Foot-grounding post-pass anchor (`first` / `min` / `off`). |
+| `--target-hrp-rest-y` / `--target-hrp-to-ankle` | 4.1197 / 3.6693 | Rthro Rig defaults; pass `2.0 / 1.6` for stock R15. |
+| `--ground-y-bias` | 0.0 | Manual studs offset after the proportional grounding model. |
+| `--hrp-scale` | auto | Geometric leg-length ratio (target_hrp_to_ankle / soma_bind). |
+| `--skip` | — | `kimodo` / `retarget` / `rbxm`; reuse existing output. Repeatable. |
 
 ## Defaults that matter
 
@@ -121,15 +203,17 @@ What's still in the pipeline that helped (kept):
 ```
 r6-uprez/
 ├── data/
-│   └── soma_tpose.bvh          # SOMA T-pose bind (copied from motion-matching)
+│   ├── soma_tpose.bvh          # SOMA T-pose bind (copied from motion-matching)
+│   └── RigData.rbxm            # Joints/attachments/R15 reference rig embedded in every CurveAnimation
 ├── lua/
 │   ├── extract_pose.lua        # Stage 1
-│   └── build_rbxm.lua          # Stage 5 (copied from motion-matching, modified to skip HRP folder)
+│   └── build_rbxm.lua          # Stage 5 (R15 hierarchy nesting, paired curves, RigData embed)
 └── python/
-    ├── pipeline.py             # Top-level orchestrator
+    ├── pipeline.py             # Asset-id orchestrator
+    ├── prompt_pipeline.py      # Prompt-only orchestrator (Stages A/B/C; --loop two-pass; multi-prompt)
     ├── extract_pose.py         # Stage 1 driver (subprocesses roblox-cli)
     ├── roblox_to_kimodo.py     # Stage 2
-    ├── run_kimodo.py           # Stage 3 (copied)
+    ├── run_kimodo.py           # Stage 3 (copied; supports duration_override)
     ├── export_r15.py           # Stage 4 retarget (copied)
     ├── soma_rig.py             # SOMA → R15 mapping + bind table (copied)
     ├── build_rbxm.py           # Stage 5 driver (copied)
