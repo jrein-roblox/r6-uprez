@@ -51,6 +51,13 @@ local CONSTRAINTS_DIR = REPO_ROOT .. "/" .. IN_DIR_REL
 local OUT_DIR = REPO_ROOT .. "/data/" .. OUT_DIR_NAME
 local R15_JSON_NAME = "r15.json"
 local PER_CLIP_RBXM_NAME = "r15.rbxm"
+-- Embedded rig metadata (joints, attachments, R15 reference rig) parented
+-- under every CurveAnimation we emit. The retarget runtime uses these
+-- instances to map curve names to live Motor6Ds; without them, downstream
+-- consumers like AnimationClipProvider have no way to resolve which joint
+-- a "LeftHand" folder drives. Authored once in Studio and committed at
+-- data/RigData.rbxm.
+local RIG_DATA_PATH = REPO_ROOT .. "/data/RigData.rbxm"
 
 print(string.format(
 	"[build_rbxm] repo_root=%s in=%s out=%s\n  per-clip=%s per-category=%s corpus=%s pattern=%s limit=%s",
@@ -119,10 +126,60 @@ local function ensureDir(path: string)
 	if not ok then warn("CreateDirectories failed", path, err) end
 end
 
+-- Load the rig-data template once at startup. Each CurveAnimation gets a
+-- :Clone() of every top-level instance — Instance can only have one parent,
+-- so cloning per-clip is required even though the source data is identical.
+-- We tolerate a missing file (warn + proceed) so this script keeps working
+-- on machines that haven't authored the rbxm yet.
+local rigDataTemplates: { Instance } = {}
+do
+	local ok, loaded = pcall(function()
+		return FileSystemService:LoadInstances(RIG_DATA_PATH)
+	end)
+	if ok and loaded then
+		for _, inst in ipairs(loaded) do
+			table.insert(rigDataTemplates, inst)
+		end
+		print(string.format(
+			"[build_rbxm] loaded %d rig-data instance(s) from %s",
+			#rigDataTemplates, RIG_DATA_PATH))
+	else
+		warn(string.format(
+			"[build_rbxm] could not load %s (%s); proceeding without rig data",
+			RIG_DATA_PATH, tostring(loaded)))
+	end
+end
+
 -- --------------------------------------------- CurveAnimation builder ----
 -- Direct port of `studio/load_curve_animation.server.luau:27` with
 -- `:RegisterAnimationClip` removed — we emit Instances to disk instead of
 -- registering them with AnimationClipProvider.
+
+-- R15 rig parenting. Folders inside the CurveAnimation are nested to match
+-- the actual Motor6D chain (LowerTorso under HumanoidRootPart, UpperTorso
+-- under LowerTorso, ...). CurveAnimation playback walks descendants by
+-- name, so the layout is purely organizational — but downstream tooling
+-- (e.g. animation editors that expect rig-shaped trees) reads it. HRP is
+-- the root and has no parent in this map (parented to the CurveAnimation
+-- itself).
+local PART_PARENT: { [string]: string } = {
+	LowerTorso     = "HumanoidRootPart",
+	UpperTorso     = "LowerTorso",
+	Head           = "UpperTorso",
+	LeftUpperArm   = "UpperTorso",
+	LeftLowerArm   = "LeftUpperArm",
+	LeftHand       = "LeftLowerArm",
+	RightUpperArm  = "UpperTorso",
+	RightLowerArm  = "RightUpperArm",
+	RightHand      = "RightLowerArm",
+	LeftUpperLeg   = "LowerTorso",
+	LeftLowerLeg   = "LeftUpperLeg",
+	LeftFoot       = "LeftLowerLeg",
+	RightUpperLeg  = "LowerTorso",
+	RightLowerLeg  = "RightUpperLeg",
+	RightFoot      = "RightLowerLeg",
+}
+
 local function buildCurveAnimation(data: any, clipName: string): Instance
 	local Cubic = Enum.KeyInterpolationMode.Cubic
 	local nFrames = data.frameCount
@@ -131,43 +188,88 @@ local function buildCurveAnimation(data: any, clipName: string): Instance
 	local ca = Instance.new("CurveAnimation")
 	ca.Name = clipName
 
-	for partName, p in pairs(data.parts) do
-		local f = Instance.new("Folder", ca); f.Name = partName
-		local rc = Instance.new("RotationCurve", f); rc.Name = "Rotation"
-		for i = 1, nFrames do
-			local cf = CFrame.new(0, 0, 0, p.rotX[i], p.rotY[i], p.rotZ[i], p.rotW[i])
-			rc:InsertKey(RotationCurveKey.new((i - 1) / frameHz, cf, Cubic))
-		end
-		if p.posX then
-			local pc = Instance.new("Vector3Curve", f); pc.Name = "Position"
-			local px, py, pz = pc:X(), pc:Y(), pc:Z()
-			for i = 1, nFrames do
-				local ti = (i - 1) / frameHz
-				px:InsertKey(FloatCurveKey.new(ti, p.posX[i], Cubic))
-				py:InsertKey(FloatCurveKey.new(ti, p.posY[i], Cubic))
-				pz:InsertKey(FloatCurveKey.new(ti, p.posZ[i], Cubic))
-			end
+	-- Embed rig metadata at the root so downstream retargeting tooling can
+	-- resolve curve names to live joints. We clone the cached template
+	-- because each CurveAnimation needs its own copy.
+	for _, template in ipairs(rigDataTemplates) do
+		template:Clone().Parent = ca
+	end
+
+	-- Pass 1: materialize a folder for every part we'll touch (every key
+	-- of data.parts plus HumanoidRootPart, which always exists so child
+	-- folders can hang off it even when no root curves are emitted —
+	-- e.g. when `_fold_root_into_lower_torso` stripped data.root). We
+	-- deliberately do not parent here; that's pass 2.
+	local folders: { [string]: Folder } = {}
+	local function ensureFolder(name: string): Folder
+		local existing = folders[name]
+		if existing then return existing end
+		local f = Instance.new("Folder")
+		f.Name = name
+		folders[name] = f
+		return f
+	end
+	ensureFolder("HumanoidRootPart")
+	for partName, _ in pairs(data.parts) do
+		ensureFolder(partName)
+	end
+
+	-- Pass 2: parent each folder by its R15 chain ancestor. Unknown names
+	-- (anything outside PART_PARENT and not HRP) fall back to direct
+	-- children of the CurveAnimation so we don't silently drop curves.
+	for name, folder in pairs(folders) do
+		local parentName = PART_PARENT[name]
+		if parentName and folders[parentName] then
+			folder.Parent = folders[parentName]
+		else
+			folder.Parent = ca
 		end
 	end
 
-	-- HumanoidRootPart curves are emitted only when r15.json includes a
-	-- `root` block. The pipeline's `_fold_root_into_lower_torso` strips it
-	-- on purpose so Studio uses the character's spawn HRP pose (feet on
-	-- ground) instead of overriding it to world origin.
-	if data.root ~= nil then
-		local hrpF = Instance.new("Folder", ca); hrpF.Name = "HumanoidRootPart"
-		local hrpRot = Instance.new("RotationCurve", hrpF); hrpRot.Name = "Rotation"
-		local hrpPos = Instance.new("Vector3Curve", hrpF); hrpPos.Name = "Position"
-		local cx, cy, cz = hrpPos:X(), hrpPos:Y(), hrpPos:Z()
+	-- Always emit Rotation and Position together. The retargeting tool
+	-- has a bug where a folder with only one of the two curves is treated
+	-- as missing the joint entirely, so when r15.json has rotation but
+	-- no translation (the common case for non-root joints) we synthesize
+	-- an identity-translation Vector3Curve. Identity in Motor6D / C1
+	-- space is (0, 0, 0) — translation here is the per-frame delta from
+	-- rest, not the world position.
+	local function writeCurves(folder: Folder, p: any)
+		local hasRot = p.rotX ~= nil
+		local hasPos = p.posX ~= nil
+		if not (hasRot or hasPos) then return end
+
+		local rc = Instance.new("RotationCurve", folder); rc.Name = "Rotation"
+		local pc = Instance.new("Vector3Curve", folder); pc.Name = "Position"
+		local px, py, pz = pc:X(), pc:Y(), pc:Z()
 		for i = 1, nFrames do
 			local ti = (i - 1) / frameHz
-			local r = data.root
-			local cf = CFrame.new(0, 0, 0, r.rotX[i], r.rotY[i], r.rotZ[i], r.rotW[i])
-			hrpRot:InsertKey(RotationCurveKey.new(ti, cf, Cubic))
-			cx:InsertKey(FloatCurveKey.new(ti, r.posX[i], Cubic))
-			cy:InsertKey(FloatCurveKey.new(ti, r.posY[i], Cubic))
-			cz:InsertKey(FloatCurveKey.new(ti, r.posZ[i], Cubic))
+			local rx = hasRot and p.rotX[i] or 0.0
+			local ry = hasRot and p.rotY[i] or 0.0
+			local rz = hasRot and p.rotZ[i] or 0.0
+			local rw = hasRot and p.rotW[i] or 1.0
+			local cf = CFrame.new(0, 0, 0, rx, ry, rz, rw)
+			rc:InsertKey(RotationCurveKey.new(ti, cf, Cubic))
+			local tx = hasPos and p.posX[i] or 0.0
+			local ty = hasPos and p.posY[i] or 0.0
+			local tz = hasPos and p.posZ[i] or 0.0
+			px:InsertKey(FloatCurveKey.new(ti, tx, Cubic))
+			py:InsertKey(FloatCurveKey.new(ti, ty, Cubic))
+			pz:InsertKey(FloatCurveKey.new(ti, tz, Cubic))
 		end
+	end
+
+	for partName, p in pairs(data.parts) do
+		writeCurves(folders[partName], p)
+	end
+
+	-- HumanoidRootPart curves are emitted only when r15.json includes a
+	-- `root` block. The pipeline's `_fold_root_into_lower_torso` strips
+	-- it on purpose so Studio uses the character's spawn HRP pose (feet
+	-- on ground) instead of overriding it to world origin. Either way
+	-- the HRP folder still exists from pass 1, so LowerTorso et al. are
+	-- correctly nested under it.
+	if data.root ~= nil then
+		writeCurves(folders["HumanoidRootPart"], data.root)
 	end
 
 	return ca
