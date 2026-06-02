@@ -57,7 +57,7 @@ local PER_CLIP_RBXM_NAME = "r15.rbxm"
 -- consumers like AnimationClipProvider have no way to resolve which joint
 -- a "LeftHand" folder drives. Authored once in Studio and committed at
 -- data/RigData.rbxm.
-local RIG_DATA_PATH = REPO_ROOT .. "/data/RigData.rbxm"
+local RIG_DATA_PATH = (_G :: any).BUILD_RBXM_RIG_DATA_PATH or (REPO_ROOT .. "/data/RigData.rbxm")
 
 print(string.format(
 	"[build_rbxm] repo_root=%s in=%s out=%s\n  per-clip=%s per-category=%s corpus=%s pattern=%s limit=%s",
@@ -233,12 +233,18 @@ local function buildCurveAnimation(data: any, clipName: string): Instance
 	-- an identity-translation Vector3Curve. Identity in Motor6D / C1
 	-- space is (0, 0, 0) — translation here is the per-frame delta from
 	-- rest, not the world position.
+	--
+	-- Uses EulerRotationCurve (XYZ order) instead of RotationCurve for
+	-- UGC animation compatibility. Quaternion from r15.json is converted
+	-- to Euler angles via CFrame:ToEulerAnglesXYZ().
 	local function writeCurves(folder: Folder, p: any)
 		local hasRot = p.rotX ~= nil
 		local hasPos = p.posX ~= nil
 		if not (hasRot or hasPos) then return end
 
-		local rc = Instance.new("RotationCurve", folder); rc.Name = "Rotation"
+		local rc = Instance.new("EulerRotationCurve", folder); rc.Name = "Rotation"
+		rc.RotationOrder = Enum.RotationOrder.XYZ
+		local erx, ery, erz = rc:X(), rc:Y(), rc:Z()
 		local pc = Instance.new("Vector3Curve", folder); pc.Name = "Position"
 		local px, py, pz = pc:X(), pc:Y(), pc:Z()
 		for i = 1, nFrames do
@@ -248,7 +254,10 @@ local function buildCurveAnimation(data: any, clipName: string): Instance
 			local rz = hasRot and p.rotZ[i] or 0.0
 			local rw = hasRot and p.rotW[i] or 1.0
 			local cf = CFrame.new(0, 0, 0, rx, ry, rz, rw)
-			rc:InsertKey(RotationCurveKey.new(ti, cf, Cubic))
+			local ex, ey, ez = cf:ToEulerAnglesXYZ()
+			erx:InsertKey(FloatCurveKey.new(ti, ex, Cubic))
+			ery:InsertKey(FloatCurveKey.new(ti, ey, Cubic))
+			erz:InsertKey(FloatCurveKey.new(ti, ez, Cubic))
 			local tx = hasPos and p.posX[i] or 0.0
 			local ty = hasPos and p.posY[i] or 0.0
 			local tz = hasPos and p.posZ[i] or 0.0

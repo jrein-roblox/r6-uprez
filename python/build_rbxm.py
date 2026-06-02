@@ -107,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         cli, "run",
         "--run", str(args.lua_script.resolve()),
         "--fs.readwrite", str(args.repo_root.resolve()),
+        "--fs.readwrite", str(REPO_ROOT.resolve()),
         "--load.asRobloxScript",
     ]
 
@@ -115,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         cmd.extend(["--lua.globals", f"{name}={value}"])
 
     add_global("BUILD_RBXM_REPO_ROOT", str(args.repo_root.resolve()))
+    add_global("BUILD_RBXM_RIG_DATA_PATH", str((REPO_ROOT / "data" / "RigData.rbxm").resolve()))
     add_global("BUILD_RBXM_PER_CLIP", "1" if args.per_clip else "0")
     add_global("BUILD_RBXM_PER_CATEGORY", "1" if args.per_category else "0")
     add_global("BUILD_RBXM_CORPUS", "1" if args.corpus else "0")
