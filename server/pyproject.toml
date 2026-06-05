@@ -1,0 +1,11 @@
+[project]
+name = "romotion-server"
+version = "0.1.0"
+description = "RoMotion backend - Kimodo animation generation server for Roblox Studio plugin"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+]

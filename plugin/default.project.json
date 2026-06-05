@@ -1,0 +1,12 @@
+{
+	"name": "RoMotion",
+	"tree": {
+		"$className": "Folder",
+		"RoMotion": {
+			"$path": "RoMotion.server.lua"
+		},
+		"src": {
+			"$path": "src"
+		}
+	}
+}
