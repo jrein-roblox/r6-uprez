@@ -38,7 +38,9 @@ import build_rbxm  # noqa: E402
 
 BIND_BVH = REPO_ROOT / "data" / "soma_tpose.bvh"
 RIG = "soma"
+RIG_R15PLUS = "soma_r15plus"
 HRP_SCALE = 0.72
+RIG_DATA_R15PLUS = REPO_ROOT / "data" / "r15plus-rigdata-hrd.rbxm"
 
 
 import math as _math
@@ -327,6 +329,7 @@ def _retarget_bvh_to_r15_json(
     looped: bool = False,
     inertial_blend_frames: int = 0,
     hrp_scale: float | None = None,
+    target_rig: str = "r15",
 ) -> dict:
     """Run the SOMA→R15 retarget. Mirrors batch_retarget._process_one.
 
@@ -334,10 +337,14 @@ def _retarget_bvh_to_r15_json(
     (None ⇒ use HRP_SCALE). Pass it when retargeting onto a non-stock
     rig (e.g., Rthro) so the hip XZ stride matches the target rig's
     leg length and feet stop sliding.
+
+    `target_rig` selects the target joint set: "r15" (standard 15 joints)
+    or "r15plus" (extended with spine, clavicles, fingers, toes).
     """
     import export_r15
 
-    export_r15.set_rig(RIG)
+    rig = RIG_R15PLUS if target_rig == "r15plus" else RIG
+    export_r15.set_rig(rig)
     result = export_r15.retarget(
         BIND_BVH, bvh_path,
         start=0, count=None,
@@ -380,7 +387,8 @@ def _retarget_bvh_to_r15_json(
     }
 
 
-def _build_rbxm(out_dir: Path, name: str, roblox_cli: str | None) -> Path:
+def _build_rbxm(out_dir: Path, name: str, roblox_cli: str | None,
+                rig_data_path: Path | None = None) -> Path:
     """Invoke build_rbxm.py against the single-clip layout we built.
 
     build_rbxm walks `<repo_root>/<in_rel>` for r15.json files. We pass
@@ -389,6 +397,8 @@ def _build_rbxm(out_dir: Path, name: str, roblox_cli: str | None) -> Path:
     1-level layout `<name>/r15.json` by synthesizing a category from the
     clip name's first underscore token. Per-clip rbxm is what we want;
     per-category and corpus emission are disabled.
+
+    `rig_data_path` overrides the embedded rig data rbxm (for R15-plus).
     """
     cmd_args = [
         "--in", out_dir.name,
@@ -399,6 +409,8 @@ def _build_rbxm(out_dir: Path, name: str, roblox_cli: str | None) -> Path:
     ]
     if roblox_cli:
         cmd_args.extend(["--roblox-cli", roblox_cli])
+    if rig_data_path:
+        cmd_args.extend(["--rig-data", str(rig_data_path)])
     print(f"[pipeline] build_rbxm {' '.join(cmd_args)}", flush=True)
     rc = build_rbxm.main(cmd_args)
     if rc != 0:
@@ -469,6 +481,11 @@ def main(argv: list[str] | None = None) -> int:
                         "character locomotion (waves, dances, gestures).")
     p.set_defaults(root_motion=False)
     p.add_argument("--roblox-cli", type=str, default=None)
+    p.add_argument("--target-rig", choices=("r15", "r15plus"), default="r15",
+                   help="Target rig for retargeting. 'r15' (default) produces "
+                        "standard 15-joint animations. 'r15plus' produces "
+                        "extended animations with spine, clavicles, fingers, "
+                        "and toes for the R15-plus character.")
     p.add_argument("--skip", action="append", default=[],
                    choices=["pose", "constraints", "kimodo", "retarget", "rbxm"],
                    help="Skip a stage (re-using existing output). Repeatable.")
@@ -555,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
             loop_passes=actual_passes,
             looped=looped_flag,
             inertial_blend_frames=args.inertial_blend,
+            target_rig=args.target_rig,
         )
         print(f"[pipeline] retarget OK: {info}")
 
@@ -563,7 +581,8 @@ def main(argv: list[str] | None = None) -> int:
         rbxm_path = clip_dir / "r15.rbxm"
         print(f"[pipeline] skip stage 5, using {rbxm_path}")
     else:
-        rbxm_path = _build_rbxm(out_dir, name, args.roblox_cli)
+        rig_data = RIG_DATA_R15PLUS if args.target_rig == "r15plus" else None
+        rbxm_path = _build_rbxm(out_dir, name, args.roblox_cli, rig_data_path=rig_data)
 
     pose_meta = json.loads((clip_dir / "pose.json").read_text())
     print(json.dumps({

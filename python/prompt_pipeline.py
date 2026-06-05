@@ -565,6 +565,11 @@ def main(argv: list[str] | None = None) -> int:
                         "angular_velocity; same Motor6D rotations on "
                         "both rigs ⇒ scale = leg ratio.")
     p.add_argument("--roblox-cli", type=str, default=None)
+    p.add_argument("--target-rig", choices=("r15", "r15plus"), default="r15",
+                   help="Target rig for retargeting. 'r15' (default) produces "
+                        "standard 15-joint animations. 'r15plus' produces "
+                        "extended animations with spine, clavicles, fingers, "
+                        "and toes for the R15-plus character.")
     p.add_argument("--skip", action="append", default=[],
                    choices=["kimodo", "retarget", "rbxm"],
                    help="Skip a stage (re-using existing output). Repeatable.")
@@ -787,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
             looped=bool(args.looped),
             inertial_blend_frames=args.inertial_blend,
             hrp_scale=effective_hrp_scale,
+            target_rig=args.target_rig,
         )
         print(f"[prompt_pipeline] retarget OK (hrp_scale={effective_hrp_scale:.3f}): {info}")
         # Ground the rest pose. Done as a post-pass on the dumped JSON
@@ -811,7 +817,9 @@ def main(argv: list[str] | None = None) -> int:
     if "rbxm" in args.skip and rbxm_path.is_file():
         print(f"[prompt_pipeline] skip stage C, using {rbxm_path}")
     else:
-        rbxm_path = parent_pipeline._build_rbxm(out_dir, name, args.roblox_cli)
+        rig_data = parent_pipeline.RIG_DATA_R15PLUS if args.target_rig == "r15plus" else None
+        rbxm_path = parent_pipeline._build_rbxm(out_dir, name, args.roblox_cli,
+                                                rig_data_path=rig_data)
 
     print(json.dumps({
         "name": name,

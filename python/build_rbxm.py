@@ -97,6 +97,10 @@ def main(argv: list[str] | None = None) -> int:
                         "or '*Loop_F*').")
     p.add_argument("--limit", type=int, default=None,
                    help="Process at most N clips after filtering.")
+    p.add_argument("--rig-data", type=Path, default=None,
+                   help="Override the embedded rig data rbxm path. Default: "
+                        "data/RigData.rbxm. For R15-plus retargets pass "
+                        "data/r15plus-rigdata-hrd.rbxm.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the resolved CLI invocation and exit.")
     args = p.parse_args(argv)
@@ -116,7 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd.extend(["--lua.globals", f"{name}={value}"])
 
     add_global("BUILD_RBXM_REPO_ROOT", str(args.repo_root.resolve()))
-    add_global("BUILD_RBXM_RIG_DATA_PATH", str((REPO_ROOT / "data" / "RigData.rbxm").resolve()))
+    rig_data_path = args.rig_data if args.rig_data else (REPO_ROOT / "data" / "RigData.rbxm")
+    add_global("BUILD_RBXM_RIG_DATA_PATH", str(rig_data_path.resolve()))
     add_global("BUILD_RBXM_PER_CLIP", "1" if args.per_clip else "0")
     add_global("BUILD_RBXM_PER_CATEGORY", "1" if args.per_category else "0")
     add_global("BUILD_RBXM_CORPUS", "1" if args.corpus else "0")

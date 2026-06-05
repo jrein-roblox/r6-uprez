@@ -162,22 +162,77 @@ end
 -- (e.g. animation editors that expect rig-shaped trees) reads it. HRP is
 -- the root and has no parent in this map (parented to the CurveAnimation
 -- itself).
+--
+-- This combined map covers BOTH standard R15 and R15-plus. Entries for
+-- bones that don't appear in the r15.json data are harmless — we only
+-- create folders for joints that have curve data. The R15-plus entries
+-- override some standard R15 parents (e.g. Head parents to Chest instead
+-- of UpperTorso) but that's correct: if Chest exists in the data then
+-- Head nests under it; if not (standard R15), Head falls through to the
+-- CurveAnimation root via the pass-2 logic below.
 local PART_PARENT: { [string]: string } = {
+	-- Standard R15 body
 	LowerTorso     = "HumanoidRootPart",
 	UpperTorso     = "LowerTorso",
-	Head           = "UpperTorso",
-	LeftUpperArm   = "UpperTorso",
+	-- R15-plus spine/chest chain (Spine under UpperTorso, Chest under Spine)
+	Spine          = "UpperTorso",
+	Chest          = "Spine",
+	-- Head: parents to Chest in R15-plus, UpperTorso in standard R15.
+	-- We always write Chest here; if Chest folder doesn't exist in the
+	-- data the fallback logic in pass 2 handles it.
+	Head           = "Chest",
+	HeadBase       = "Head",
+	-- Left arm with clavicle
+	LeftClavicle   = "Chest",
+	LeftUpperArm   = "LeftClavicle",
 	LeftLowerArm   = "LeftUpperArm",
 	LeftHand       = "LeftLowerArm",
-	RightUpperArm  = "UpperTorso",
+	-- Left hand fingers
+	LeftHandThumb1  = "LeftHand",
+	LeftHandThumb2  = "LeftHandThumb1",
+	LeftHandThumb3  = "LeftHandThumb2",
+	LeftHandIndex1  = "LeftHand",
+	LeftHandIndex2  = "LeftHandIndex1",
+	LeftHandIndex3  = "LeftHandIndex2",
+	LeftHandMiddle1 = "LeftHand",
+	LeftHandMiddle2 = "LeftHandMiddle1",
+	LeftHandMiddle3 = "LeftHandMiddle2",
+	LeftHandRing1   = "LeftHand",
+	LeftHandRing2   = "LeftHandRing1",
+	LeftHandRing3   = "LeftHandRing2",
+	LeftHandPinky1  = "LeftHand",
+	LeftHandPinky2  = "LeftHandPinky1",
+	LeftHandPinky3  = "LeftHandPinky2",
+	-- Right arm with clavicle
+	RightClavicle  = "Chest",
+	RightUpperArm  = "RightClavicle",
 	RightLowerArm  = "RightUpperArm",
 	RightHand      = "RightLowerArm",
+	-- Right hand fingers
+	RightHandThumb1  = "RightHand",
+	RightHandThumb2  = "RightHandThumb1",
+	RightHandThumb3  = "RightHandThumb2",
+	RightHandIndex1  = "RightHand",
+	RightHandIndex2  = "RightHandIndex1",
+	RightHandIndex3  = "RightHandIndex2",
+	RightHandMiddle1 = "RightHand",
+	RightHandMiddle2 = "RightHandMiddle1",
+	RightHandMiddle3 = "RightHandMiddle2",
+	RightHandRing1   = "RightHand",
+	RightHandRing2   = "RightHandRing1",
+	RightHandRing3   = "RightHandRing2",
+	RightHandPinky1  = "RightHand",
+	RightHandPinky2  = "RightHandPinky1",
+	RightHandPinky3  = "RightHandPinky2",
+	-- Legs with toes
 	LeftUpperLeg   = "LowerTorso",
 	LeftLowerLeg   = "LeftUpperLeg",
 	LeftFoot       = "LeftLowerLeg",
+	LeftToeBase    = "LeftFoot",
 	RightUpperLeg  = "LowerTorso",
 	RightLowerLeg  = "RightUpperLeg",
 	RightFoot      = "RightLowerLeg",
+	RightToeBase   = "RightFoot",
 }
 
 local function buildCurveAnimation(data: any, clipName: string): Instance
@@ -214,14 +269,24 @@ local function buildCurveAnimation(data: any, clipName: string): Instance
 		ensureFolder(partName)
 	end
 
-	-- Pass 2: parent each folder by its R15 chain ancestor. Unknown names
-	-- (anything outside PART_PARENT and not HRP) fall back to direct
-	-- children of the CurveAnimation so we don't silently drop curves.
+	-- Pass 2: parent each folder by its R15 chain ancestor. Walk up the
+	-- PART_PARENT chain until we find an ancestor that actually has a
+	-- folder in this clip's data. This handles both R15-plus (where
+	-- intermediate bones like Chest exist) and standard R15 (where they
+	-- don't — e.g. Head walks up Chest→Spine→UpperTorso and lands on
+	-- UpperTorso if Chest/Spine aren't in the data).
 	for name, folder in pairs(folders) do
 		local parentName = PART_PARENT[name]
-		if parentName and folders[parentName] then
-			folder.Parent = folders[parentName]
-		else
+		local placed = false
+		while parentName do
+			if folders[parentName] then
+				folder.Parent = folders[parentName]
+				placed = true
+				break
+			end
+			parentName = PART_PARENT[parentName]
+		end
+		if not placed then
 			folder.Parent = ca
 		end
 	end

@@ -83,9 +83,18 @@ def set_rig(name: str) -> None:
         R15_JOINTS = SOMA_R15_JOINTS
         R15_CHAINS = SOMA_R15_CHAINS
         HARDCODED_BIND_WORLD = SOMA_BIND_WORLD
+    elif name == "soma_r15plus":
+        from soma_r15plus_rig import (
+            SOMA_R15PLUS_JOINTS,
+            SOMA_R15PLUS_CHAINS,
+            SOMA_R15PLUS_BIND_WORLD,
+        )
+        R15_JOINTS = SOMA_R15PLUS_JOINTS
+        R15_CHAINS = SOMA_R15PLUS_CHAINS
+        HARDCODED_BIND_WORLD = SOMA_R15PLUS_BIND_WORLD
     else:
         raise ValueError(
-            f"Unknown rig {name!r} (expected 'geno', 'motusman', 'uefn', or 'soma')"
+            f"Unknown rig {name!r} (expected 'geno', 'motusman', 'uefn', 'soma', or 'soma_r15plus')"
         )
     _ACTIVE_RIG = name
 
@@ -374,11 +383,45 @@ def retarget(bind_path: Path, anim_path: Path, start: int, count: int | None,
         # joint we retarget. Consistent across all clips, independent of the
         # --bind BVH file (which is still loaded for skeleton/hierarchy info
         # but its rotations are overridden for joints in HARDCODED_BIND_WORLD).
-        new_world_rot = np.array(bind["world_rot"][0], copy=True)
+        old_world_rot = np.array(bind["world_rot"][0], copy=True)
+        new_world_rot = old_world_rot.copy()
         names = list(anim["names"])
+        overridden = set()
         for jname, wq in HARDCODED_BIND_WORLD.items():
             if jname in names:
                 new_world_rot[names.index(jname)] = wq
+                overridden.add(names.index(jname))
+        # Propagate bind corrections to descendants of overridden joints.
+        # When a joint's bind world rotation is overridden but its children
+        # are not, the children still carry the old (e.g. T-pose) world
+        # rotation. This breaks the parent-child delta math because
+        # inv(D_parent) * D_child assumes both were computed from a
+        # consistent FK chain. Fix: for each non-overridden joint whose
+        # BVH-parent (or ancestor) was overridden, apply the same rigid
+        # correction: new_bind[child] = correction * old_bind[child],
+        # where correction = new_bind[parent] * inv(old_bind[parent]).
+        parents_arr = anim["parents"]
+        for j in range(len(names)):
+            if j in overridden:
+                continue
+            p = parents_arr[j]
+            if p < 0:
+                continue
+            # Walk up to find the nearest ancestor that was overridden or
+            # already corrected (any ancestor whose new != old).
+            correction_src = p
+            while correction_src >= 0:
+                if not np.allclose(new_world_rot[correction_src], old_world_rot[correction_src], atol=1e-7):
+                    break
+                correction_src = parents_arr[correction_src]
+            if correction_src < 0:
+                continue
+            # correction = new_parent * inv(old_parent)
+            correction = quat.mul(
+                new_world_rot[correction_src:correction_src+1],
+                quat.inv(old_world_rot[correction_src:correction_src+1]),
+            )
+            new_world_rot[j] = quat.mul(correction, old_world_rot[j:j+1])[0]
         bind = dict(bind)
         bind["world_rot"] = new_world_rot[None, :, :]
 
@@ -732,14 +775,16 @@ def main(argv: list[str] | None = None) -> int:
         "Reduces output size and Studio CurveAnimation key count proportionally.",
     )
     p.add_argument(
-        "--rig", choices=("geno", "motusman", "uefn", "soma"), default="geno",
+        "--rig", choices=("geno", "motusman", "uefn", "soma", "soma_r15plus"), default="geno",
         help="Source skeleton layout. 'geno' (default) is the lafan1 BVH rig; "
         "'motusman' is the MocapOnline MotusMan_v55 FBX rig; 'uefn' is the "
         "Unreal-Engine Mobility Starter GASP rig (Z-up FBX, auto-converted "
         "to Y-up by the loader); 'soma' is Kimodo's somaskel77 BVH rig "
-        "(synthetic Root + Hips, T-pose bind). Selects which R15_JOINTS / "
-        "R15_CHAINS / bind tables are used — does NOT affect file-format "
-        "dispatch (that's by --anim's extension).",
+        "(synthetic Root + Hips, T-pose bind, retargets to standard R15); "
+        "'soma_r15plus' is the same somaskel77 source but retargets to the "
+        "R15-plus rig (spine, clavicles, fingers, toes). Selects which "
+        "R15_JOINTS / R15_CHAINS / bind tables are used — does NOT affect "
+        "file-format dispatch (that's by --anim's extension).",
     )
     p.add_argument(
         "--hrp-scale", type=float, default=1.0,
