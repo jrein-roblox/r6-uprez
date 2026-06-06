@@ -24,12 +24,13 @@ end
 
 function BackendService.generate(request: {
 	prompts: { { text: string, start_time: number, end_time: number } },
-	constraints: { { effector: string, time: number, position: { number }, rotation: { number }? } }?,
+	constraints: { { effector: string, time: number, position: { number } } }?,
 	duration: number,
 	looped: boolean?,
 	seed: number?,
 	cfg_weight: number?,
 	diffusion_steps: number?,
+	previous_job_id: string?,
 }): { job_id: string, status: string }
 	return postJson("/generate", request) :: any
 end

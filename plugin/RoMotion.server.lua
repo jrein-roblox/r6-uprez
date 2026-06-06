@@ -116,7 +116,7 @@ local function buildUI()
 
 	local rigLabel = Instance.new("TextLabel")
 	rigLabel.Name = "RigLabel"
-	rigLabel.Size = UDim2.new(0, 200, 1, 0)
+	rigLabel.Size = UDim2.new(0, 150, 1, 0)
 	rigLabel.BackgroundTransparency = 1
 	rigLabel.Text = "No rig selected"
 	rigLabel.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.MainText)
@@ -125,10 +125,66 @@ local function buildUI()
 	rigLabel.TextXAlignment = Enum.TextXAlignment.Left
 	rigLabel.Parent = topBar
 
+	-- Duration input
+	local durLabel = Instance.new("TextLabel")
+	durLabel.Size = UDim2.new(0, 50, 1, 0)
+	durLabel.BackgroundTransparency = 1
+	durLabel.Text = "Duration:"
+	durLabel.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
+	durLabel.TextSize = 12
+	durLabel.Font = Enum.Font.SourceSans
+	durLabel.TextXAlignment = Enum.TextXAlignment.Right
+	durLabel.Parent = topBar
+
+	local durInput = Instance.new("TextBox")
+	durInput.Name = "DurationInput"
+	durInput.Size = UDim2.new(0, 40, 0, 20)
+	durInput.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+	durInput.BorderColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Border)
+	durInput.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+	durInput.Text = tostring(Constants.DEFAULT_DURATION)
+	durInput.TextSize = 12
+	durInput.Font = Enum.Font.Code
+	durInput.ClearTextOnFocus = false
+	durInput.Parent = topBar
+	local durCorner = Instance.new("UICorner")
+	durCorner.CornerRadius = UDim.new(0, 3)
+	durCorner.Parent = durInput
+
+	local durSuffix = Instance.new("TextLabel")
+	durSuffix.Size = UDim2.new(0, 12, 1, 0)
+	durSuffix.BackgroundTransparency = 1
+	durSuffix.Text = "s"
+	durSuffix.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
+	durSuffix.TextSize = 12
+	durSuffix.Font = Enum.Font.SourceSans
+	durSuffix.Parent = topBar
+
+	durInput.FocusLost:Connect(function()
+		local val = tonumber(durInput.Text)
+		if val and val > 0.5 and val <= 30 then
+			appState.duration:set(val)
+			-- Also stretch the last prompt block to fill
+			local prompts_val = appState.prompts:get()
+			if #prompts_val > 0 then
+				local updated = table.clone(prompts_val)
+				updated[#updated] = table.clone(updated[#updated])
+				updated[#updated].endTime = val
+				appState.prompts:set(updated)
+			end
+		else
+			durInput.Text = string.format("%.1f", appState.duration:get())
+		end
+	end)
+
+	appState.duration:subscribe(function(d)
+		durInput.Text = string.format("%.1f", d)
+	end)
+
 	local serverDot = Instance.new("Frame")
 	serverDot.Name = "ServerDot"
 	serverDot.Size = UDim2.new(0, 8, 0, 8)
-	serverDot.BackgroundColor3 = Color3.fromRGB(244, 67, 54) -- red = disconnected
+	serverDot.BackgroundColor3 = Color3.fromRGB(244, 67, 54)
 	serverDot.Parent = topBar
 	local corner = Instance.new("UICorner")
 	corner.CornerRadius = UDim.new(1, 0)
@@ -136,7 +192,7 @@ local function buildUI()
 
 	local serverLabel = Instance.new("TextLabel")
 	serverLabel.Name = "ServerLabel"
-	serverLabel.Size = UDim2.new(0, 80, 1, 0)
+	serverLabel.Size = UDim2.new(0, 50, 1, 0)
 	serverLabel.BackgroundTransparency = 1
 	serverLabel.Text = "Server"
 	serverLabel.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
@@ -282,7 +338,7 @@ local function buildUI()
 	constraintLayout.Parent = constraintArea
 
 	for i, effName in Constants.EFFECTORS do
-		local track = Instance.new("Frame")
+		local track = Instance.new("TextButton")
 		track.Name = effName
 		track.Size = UDim2.new(1, 0, 0, Constants.CONSTRAINT_TRACK_HEIGHT)
 		track.BackgroundColor3 = if i % 2 == 0
@@ -291,6 +347,8 @@ local function buildUI()
 		track.BorderSizePixel = 0
 		track.LayoutOrder = i
 		track.ClipsDescendants = true
+		track.AutoButtonColor = false
+		track.Text = ""
 		track.Parent = constraintArea
 
 		local label = Instance.new("TextLabel")
@@ -306,6 +364,37 @@ local function buildUI()
 		local pad = Instance.new("UIPadding")
 		pad.PaddingLeft = UDim.new(0, 4)
 		pad.Parent = label
+
+		-- Click to place a constraint at the current playback time.
+		-- Clones the full effector chain as a poseable ghost.
+		local eName = effName
+		track.MouseButton1Click:Connect(function()
+			local rig = appState.rig:get()
+			if not rig then return end
+
+			-- Ensure animation is stepped at current time so transforms are populated
+			if playbackSvc then
+				playbackSvc:ensureStepped()
+			end
+
+			local time = appState.playbackTime:get()
+			local effPart = RigService.getEffectorPart(rig, eName)
+			if not effPart then return end
+
+			local color = Constants.EFFECTOR_COLORS[eName] or Color3.new(1, 1, 1)
+			local chainModel = RigService.cloneChain(rig, eName, color)
+			if not chainModel then return end
+
+			local constraints_val = table.clone(appState.constraints:get())
+			table.insert(constraints_val, {
+				effector = eName,
+				time = time,
+				cframe = effPart.CFrame,
+				chain = chainModel, -- ChainData from RigService.cloneChain
+			})
+			table.sort(constraints_val, function(a, b) return a.time < b.time end)
+			appState.constraints:set(constraints_val)
+		end)
 	end
 
 	-- Playhead
@@ -411,13 +500,50 @@ local function buildUI()
 					})
 				end
 
+				-- Compute ground level from the rig's actual foot positions
+				local lFoot = rig.model:FindFirstChild("LeftFoot", true) :: BasePart?
+				local rFoot = rig.model:FindFirstChild("RightFoot", true) :: BasePart?
+				local groundY = 0
+				if lFoot and rFoot then
+					groundY = math.min(
+						lFoot.Position.Y - lFoot.Size.Y / 2,
+						rFoot.Position.Y - rFoot.Size.Y / 2
+					)
+				elseif lFoot then
+					groundY = lFoot.Position.Y - lFoot.Size.Y / 2
+				end
+
+				local hrpPos = rig.rootPart.Position
+				local _, hrpYaw, _ = rig.rootPart.CFrame:ToEulerAnglesYXZ()
+				local groundCF = CFrame.new(hrpPos.X, groundY, hrpPos.Z)
+					* CFrame.fromEulerAnglesYXZ(0, hrpYaw, 0)
+
+				-- Root position: HRP XZ (stable anchor) + LowerTorso Y (height).
+				-- HRP doesn't move with animation, prevents drift across iterations.
+				local ltPart = rig.model:FindFirstChild("LowerTorso", true) :: BasePart?
+				local rootLocalPos = { 0, 0, 0 }
+				if ltPart then
+					local ltY = ltPart.Position.Y - groundY
+					-- XZ = 0 relative to character center (HRP is the anchor)
+					rootLocalPos = { 0, ltY, 0 }
+				end
+
+				-- Ensure animation is active so rig parts are at animated positions
+				if playbackSvc then
+					playbackSvc:ensureStepped()
+				end
+
 				local constraintsList = {}
 				for _, c in appState.constraints:get() do
+					local chainCFrames = {}
+					if c.chain and type(c.chain) == "table" and c.chain.parts then
+						chainCFrames = RigService.readChainWorldCFrames(c.chain, c.effector, groundCF)
+					end
+
 					table.insert(constraintsList, {
 						effector = c.effector,
 						time = c.time,
-						position = { c.cframe.Position.X, c.cframe.Position.Y, c.cframe.Position.Z },
-						rotation = nil, -- TODO: extract from CFrame
+						chain_world_cframes = chainCFrames,
 					})
 				end
 
@@ -478,8 +604,9 @@ local function buildUI()
 			end)
 
 			if not ok then
+				warn("[RoMotion] Generation error:", tostring(result))
 				appState.generationStatus:set("failed")
-				appState.generationMessage:set(tostring(result))
+				appState.generationMessage:set("Error (see Output)")
 			end
 		end)
 	end)
@@ -533,8 +660,52 @@ local function buildUI()
 		end
 	end)
 
+	-- Prompt editing popup (hidden until double-click)
+	local editPopup = Instance.new("Frame")
+	editPopup.Name = "EditPopup"
+	editPopup.Size = UDim2.new(0, 250, 0, 30)
+	editPopup.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+	editPopup.BorderColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Border)
+	editPopup.BorderSizePixel = 1
+	editPopup.Visible = false
+	editPopup.ZIndex = 20
+	editPopup.Parent = timelineFrame
+	local editCorner = Instance.new("UICorner")
+	editCorner.CornerRadius = UDim.new(0, 4)
+	editCorner.Parent = editPopup
+
+	local editBox = Instance.new("TextBox")
+	editBox.Size = UDim2.new(1, -8, 1, -4)
+	editBox.Position = UDim2.new(0, 4, 0, 2)
+	editBox.BackgroundTransparency = 1
+	editBox.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+	editBox.TextSize = 12
+	editBox.Font = Enum.Font.SourceSans
+	editBox.ClearTextOnFocus = false
+	editBox.TextXAlignment = Enum.TextXAlignment.Left
+	editBox.ZIndex = 21
+	editBox.Parent = editPopup
+
+	local editingIndex: number? = nil
+
+	editBox.FocusLost:Connect(function(enterPressed)
+		if editingIndex and enterPressed then
+			local prompts_val = appState.prompts:get()
+			if editingIndex <= #prompts_val then
+				local updated = table.clone(prompts_val)
+				updated[editingIndex] = table.clone(updated[editingIndex])
+				updated[editingIndex].text = editBox.Text
+				appState.prompts:set(updated)
+			end
+		end
+		editPopup.Visible = false
+		editingIndex = nil
+	end)
+
 	-- Prompt block rendering
 	local promptBlocks: { Frame } = {}
+	local lastClickTime = 0
+	local lastClickIndex = 0
 
 	local function renderPromptBlocks()
 		for _, block in promptBlocks do
@@ -553,13 +724,15 @@ local function buildUI()
 
 			if width < 2 then continue end
 
-			local block = Instance.new("Frame")
+			local block = Instance.new("TextButton")
 			block.Name = "Prompt_" .. tostring(i)
 			block.Size = UDim2.new(0, math.floor(width), 1, -4)
 			block.Position = UDim2.new(0, math.floor(startPx), 0, 2)
 			block.BackgroundColor3 = Constants.PROMPT_COLORS[((i - 1) % #Constants.PROMPT_COLORS) + 1]
 			block.BackgroundTransparency = 0.3
 			block.BorderSizePixel = 0
+			block.AutoButtonColor = false
+			block.Text = ""
 			block.Parent = promptTrack
 
 			local rc = Instance.new("UICorner")
@@ -581,6 +754,30 @@ local function buildUI()
 			lblPad.PaddingRight = UDim.new(0, 4)
 			lblPad.Parent = lbl
 
+			-- Double-click to edit
+			local idx = i
+			block.MouseButton1Click:Connect(function()
+				local now = os.clock()
+				if lastClickIndex == idx and (now - lastClickTime) < 0.4 then
+					-- Double-click: open edit popup
+					editBox.Text = prompt.text
+					editPopup.Position = UDim2.new(0, math.floor(startPx), 0, Constants.RULER_HEIGHT - 2)
+					editPopup.Size = UDim2.new(0, math.max(200, math.floor(width)), 0, 30)
+					editPopup.Visible = true
+					editingIndex = idx
+					editBox:CaptureFocus()
+				end
+				lastClickTime = now
+				lastClickIndex = idx
+			end)
+
+			-- Right-click to delete
+			block.MouseButton2Click:Connect(function()
+				local updated = table.clone(appState.prompts:get())
+				table.remove(updated, idx)
+				appState.prompts:set(updated)
+			end)
+
 			table.insert(promptBlocks, block)
 		end
 	end
@@ -589,7 +786,7 @@ local function buildUI()
 	appState.pixelsPerSecond:subscribe(renderPromptBlocks)
 	appState.scrollOffset:subscribe(renderPromptBlocks)
 
-	-- Constraint diamond rendering
+	-- Constraint diamond rendering on timeline
 	local constraintDiamonds: { Frame } = {}
 
 	local function renderConstraints()
@@ -602,19 +799,34 @@ local function buildUI()
 		local pps = appState.pixelsPerSecond:get()
 		local scroll = appState.scrollOffset:get()
 
-		for _, constraint in constraints_val do
+		for i, constraint in constraints_val do
 			local effTrack = constraintArea:FindFirstChild(constraint.effector)
 			if not effTrack then continue end
 
 			local px = (constraint.time - scroll) * pps
-			local diamond = Instance.new("Frame")
-			diamond.Name = "C_" .. constraint.effector
+			local diamond = Instance.new("TextButton")
+			diamond.Name = "C_" .. constraint.effector .. "_" .. tostring(i)
 			diamond.Size = UDim2.new(0, 10, 0, 10)
-			diamond.Position = UDim2.new(0, math.floor(px) - 5 + 70, 0.5, -5)
+			diamond.Position = UDim2.new(0, math.floor(px) - 5, 0.5, -5)
 			diamond.BackgroundColor3 = Constants.EFFECTOR_COLORS[constraint.effector] or Color3.new(1, 1, 1)
 			diamond.Rotation = 45
 			diamond.BorderSizePixel = 0
+			diamond.AutoButtonColor = false
+			diamond.Text = ""
 			diamond.Parent = effTrack
+
+			-- Right-click to delete constraint (and its chain)
+			local idx = i
+			diamond.MouseButton2Click:Connect(function()
+				local updated = table.clone(appState.constraints:get())
+				local removed = table.remove(updated, idx)
+				if removed then
+					if removed.chain and type(removed.chain) == "table" and removed.chain.model then
+						RigService.destroyChain(removed.chain)
+					end
+				end
+				appState.constraints:set(updated)
+			end)
 
 			table.insert(constraintDiamonds, diamond)
 		end
@@ -782,9 +994,9 @@ task.defer(function()
 	if #appState.prompts:get() == 0 then
 		appState.prompts:set({
 			{
-				text = "a person walking forwards",
+				text = "a person walking forward",
 				startTime = 0,
-				endTime = Constants.DEFAULT_DURATION,
+				endTime = appState.duration:get(),
 			},
 		})
 	end

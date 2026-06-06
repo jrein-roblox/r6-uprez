@@ -136,13 +136,31 @@ function PlaybackService:stop()
 	self.TimeChanged:Fire(0)
 end
 
+function PlaybackService:ensureStepped()
+	if not self._track then return end
+	-- Make sure the track is active so AnimationConstraint.Transform is populated
+	if self._state == "stopped" then
+		self._track:Play(0, 1, 0)
+		self._state = "paused"
+	end
+	self._rig.animator:StepAnimations(0)
+end
+
 function PlaybackService:seekTo(time: number)
 	if not self._track then
 		return
 	end
+	-- Ensure the track is loaded and can be scrubbed even when "stopped"
+	if self._state == "stopped" then
+		self._track:Play(0, 1, 0) -- play at speed 0 (paused but active)
+		self._state = "paused"
+	elseif self._state == "playing" then
+		self._track:AdjustSpeed(0)
+		self._state = "paused"
+	end
 	self._track.TimePosition = math.clamp(time, 0, self._duration)
 	self._rig.animator:StepAnimations(0)
-	self.TimeChanged:Fire(time)
+	self.TimeChanged:Fire(self._track.TimePosition)
 end
 
 function PlaybackService:getDuration(): number
