@@ -543,8 +543,7 @@ local function buildUI()
 					})
 				end
 
-				-- XZ: HRP center (stable). Y: floor level (Kimodo Y=0 = floor).
-				-- rigRestGroundY is computed once at rig selection (stable).
+				-- XZ: HRP center (stable). Y: floor (rigRestGroundY, stable).
 				local hrpPos = rig.rootPart.Position
 				local _, hrpYaw, _ = rig.rootPart.CFrame:ToEulerAnglesYXZ()
 				local groundCF = CFrame.new(hrpPos.X, rigRestGroundY, hrpPos.Z)
