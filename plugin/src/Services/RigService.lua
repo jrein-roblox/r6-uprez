@@ -173,10 +173,12 @@ function RigService.cloneChain(rig: RigInfo, effector: string, color: Color3): C
 	end
 
 	-- Create cloned parts at animated positions
+	local effectorName = chainNames[#chainNames]
 	for _, partName in chainNames do
 		local srcPart = rig.model:FindFirstChild(partName, true) :: BasePart?
 		if not srcPart or not srcPart:IsA("BasePart") then continue end
 
+		local isEffector = (partName == effectorName)
 		local clone = Instance.new("Part")
 		clone.Name = partName
 		clone.Size = srcPart.Size
@@ -185,12 +187,21 @@ function RigService.cloneChain(rig: RigInfo, effector: string, color: Color3): C
 		clone.CanCollide = false
 		clone.CanQuery = true
 		clone.CanTouch = false
-		clone.Transparency = 0.5
+		clone.Transparency = if isEffector then 0.3 else 0.6
 		clone.Color = color
-		clone.Material = Enum.Material.ForceField
+		clone.Material = if isEffector then Enum.Material.Neon else Enum.Material.ForceField
 		clone.CastShadow = false
 		clone.Parent = model
 		clonedParts[partName] = clone
+
+		-- Add selection box on the effector for visibility
+		if isEffector then
+			local sel = Instance.new("SelectionBox")
+			sel.Adornee = clone
+			sel.Color3 = color
+			sel.LineThickness = 0.03
+			sel.Parent = clone
+		end
 	end
 
 	-- Store joints (only those with both parts in the chain) for readChainTransforms

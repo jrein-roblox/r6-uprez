@@ -337,8 +337,13 @@ local function buildUI()
 	constraintLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	constraintLayout.Parent = constraintArea
 
+	-- Forward declarations for constraint drag system
+	local constraintDiamonds: { Frame } = {}
+	local draggingConstraint: number? = nil
+	local renderConstraints: () -> ()
+
 	for i, effName in Constants.EFFECTORS do
-		local track = Instance.new("TextButton")
+		local track = Instance.new("Frame")
 		track.Name = effName
 		track.Size = UDim2.new(1, 0, 0, Constants.CONSTRAINT_TRACK_HEIGHT)
 		track.BackgroundColor3 = if i % 2 == 0
@@ -347,8 +352,7 @@ local function buildUI()
 		track.BorderSizePixel = 0
 		track.LayoutOrder = i
 		track.ClipsDescendants = true
-		track.AutoButtonColor = false
-		track.Text = ""
+		track.Active = true
 		track.Parent = constraintArea
 
 		local label = Instance.new("TextLabel")
@@ -367,8 +371,10 @@ local function buildUI()
 
 		-- Click to place a constraint at the current playback time.
 		-- Clones the full effector chain as a poseable ghost.
+		-- Label click to add constraint (not the whole track)
 		local eName = effName
-		track.MouseButton1Click:Connect(function()
+		label.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
 			local rig = appState.rig:get()
 			if not rig then return end
 
@@ -394,6 +400,40 @@ local function buildUI()
 			})
 			table.sort(constraints_val, function(a, b) return a.time < b.time end)
 			appState.constraints:set(constraints_val)
+		end)
+
+		-- Drag movement on this track
+		track.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseMovement and draggingConstraint then
+				local relX = input.Position.X - constraintArea.AbsolutePosition.X
+				local newTime = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
+				local maxT = appState.duration:get()
+				if maxT <= 0 and playbackSvc then maxT = playbackSvc:getDuration() end
+				if maxT <= 0 then maxT = 10 end
+				newTime = math.clamp(newTime, 0, maxT)
+
+				-- Move the diamond directly (don't trigger renderConstraints)
+				local pps = appState.pixelsPerSecond:get()
+				local scroll = appState.scrollOffset:get()
+				local px = (newTime - scroll) * pps
+				if constraintDiamonds[draggingConstraint] then
+					constraintDiamonds[draggingConstraint].Position = UDim2.new(0, math.floor(px) - 8, 0.5, -8)
+				end
+
+				-- Update state silently (renderConstraints skips during drag)
+				local updated = table.clone(appState.constraints:get())
+				if draggingConstraint <= #updated then
+					updated[draggingConstraint] = table.clone(updated[draggingConstraint])
+					updated[draggingConstraint].time = newTime
+					appState.constraints:set(updated)
+				end
+			end
+		end)
+		track.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				draggingConstraint = nil
+				renderConstraints() -- rebuild now that drag is over
+			end
 		end)
 	end
 
@@ -638,20 +678,101 @@ local function buildUI()
 		end)
 	end)
 
-	-- Timeline scrub interaction
-	timelineFrame.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			local relX = input.Position.X - timelineFrame.AbsolutePosition.X
+	-- Timeline scrub interaction (click + drag)
+	local isScrubbing = false
+
+	local function scrubToInput(input: InputObject)
+		local relX = input.Position.X - timelineFrame.AbsolutePosition.X
+		local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
+		local maxTime = appState.duration:get()
+		if maxTime <= 0 and playbackSvc then
+			maxTime = playbackSvc:getDuration()
+		end
+		if maxTime <= 0 then maxTime = 10 end
+		time = math.clamp(time, 0, maxTime)
+		appState.playbackTime:set(time)
+		if playbackSvc then
+			playbackSvc:seekTo(time)
+		end
+	end
+
+	-- Drag handling
+	local function endDrag()
+		draggingPromptIdx = nil
+		draggingPromptEdge = nil
+		draggingConstraint = nil
+		isScrubbing = false
+	end
+
+	-- Movement handler shared by all drag-sensitive areas
+	local function onDragMove(input: InputObject)
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+		if isScrubbing then
+			scrubToInput(input)
+		end
+
+		if draggingPromptIdx then
+			local relX = input.Position.X - promptTrack.AbsolutePosition.X
 			local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-			time = math.max(0, math.min(time, appState.duration:get()))
-			appState.playbackTime:set(time)
-			if playbackSvc then
-				playbackSvc:seekTo(time)
+			time = math.clamp(time, 0, appState.duration:get())
+			local updated = table.clone(appState.prompts:get())
+			if draggingPromptIdx <= #updated then
+				updated[draggingPromptIdx] = table.clone(updated[draggingPromptIdx])
+				if draggingPromptEdge == "right" then
+					updated[draggingPromptIdx].endTime = math.max(time, updated[draggingPromptIdx].startTime + 0.2)
+				elseif draggingPromptEdge == "left" then
+					updated[draggingPromptIdx].startTime = math.min(time, updated[draggingPromptIdx].endTime - 0.2)
+				end
+				appState.prompts:set(updated)
 			end
+		end
+
+		if draggingConstraint then
+			local relX = input.Position.X - constraintArea.AbsolutePosition.X
+			local newTime = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
+			newTime = math.clamp(newTime, 0, appState.duration:get())
+			local updated = table.clone(appState.constraints:get())
+			if draggingConstraint <= #updated then
+				updated[draggingConstraint] = table.clone(updated[draggingConstraint])
+				updated[draggingConstraint].time = newTime
+				appState.constraints:set(updated)
+			end
+		end
+	end
+
+	-- Ensure all timeline frames receive input events
+	timelineFrame.Active = true
+	promptTrack.Active = true
+	constraintArea.Active = true
+	mainFrame.Active = true
+
+	-- Listen on ALL relevant areas for movement
+	timelineFrame.InputChanged:Connect(onDragMove)
+	promptTrack.InputChanged:Connect(onDragMove)
+	constraintArea.InputChanged:Connect(onDragMove)
+
+	-- Release: listen on multiple elements for redundancy
+	local function onInputEnded(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			endDrag()
+		end
+	end
+	mainFrame.InputEnded:Connect(onInputEnded)
+	timelineFrame.InputEnded:Connect(onInputEnded)
+	promptTrack.InputEnded:Connect(onInputEnded)
+	constraintArea.InputEnded:Connect(onInputEnded)
+
+	-- Timeline scrub — only from the ruler (top bar with time labels)
+	ruler.Active = true
+	ruler.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			isScrubbing = true
+			scrubToInput(input)
 		end
 	end)
 
-	-- Zoom with scroll wheel
+	-- Zoom only (scrub movement handled by drag overlay)
 	timelineFrame.InputChanged:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseWheel then
 			local current = appState.pixelsPerSecond:get()
@@ -659,6 +780,7 @@ local function buildUI()
 			appState.pixelsPerSecond:set(math.clamp(current * factor, 20, 500))
 		end
 	end)
+
 
 	-- Prompt editing popup (hidden until double-click)
 	local editPopup = Instance.new("Frame")
@@ -706,8 +828,11 @@ local function buildUI()
 	local promptBlocks: { Frame } = {}
 	local lastClickTime = 0
 	local lastClickIndex = 0
+	local draggingPromptIdx: number? = nil
+	local draggingPromptEdge: string? = nil -- "left" or "right"
 
 	local function renderPromptBlocks()
+		if draggingPromptIdx then return end -- don't rebuild while dragging
 		for _, block in promptBlocks do
 			block:Destroy()
 		end
@@ -724,15 +849,14 @@ local function buildUI()
 
 			if width < 2 then continue end
 
-			local block = Instance.new("TextButton")
+			local block = Instance.new("Frame")
 			block.Name = "Prompt_" .. tostring(i)
 			block.Size = UDim2.new(0, math.floor(width), 1, -4)
 			block.Position = UDim2.new(0, math.floor(startPx), 0, 2)
 			block.BackgroundColor3 = Constants.PROMPT_COLORS[((i - 1) % #Constants.PROMPT_COLORS) + 1]
 			block.BackgroundTransparency = 0.3
 			block.BorderSizePixel = 0
-			block.AutoButtonColor = false
-			block.Text = ""
+			block.Active = true
 			block.Parent = promptTrack
 
 			local rc = Instance.new("UICorner")
@@ -740,56 +864,120 @@ local function buildUI()
 			rc.Parent = block
 
 			local lbl = Instance.new("TextLabel")
-			lbl.Size = UDim2.fromScale(1, 1)
+			lbl.Size = UDim2.new(1, -12, 1, 0)
+			lbl.Position = UDim2.new(0, 6, 0, 0)
 			lbl.BackgroundTransparency = 1
 			lbl.Text = prompt.text
 			lbl.TextColor3 = Color3.new(1, 1, 1)
 			lbl.TextSize = 11
 			lbl.Font = Enum.Font.SourceSans
 			lbl.TextTruncate = Enum.TextTruncate.AtEnd
+			lbl.TextXAlignment = Enum.TextXAlignment.Left
 			lbl.Parent = block
 
-			local lblPad = Instance.new("UIPadding")
-			lblPad.PaddingLeft = UDim.new(0, 4)
-			lblPad.PaddingRight = UDim.new(0, 4)
-			lblPad.Parent = lbl
+			-- Right edge handle for resizing
+			local rightHandle = Instance.new("Frame")
+			rightHandle.Size = UDim2.new(0, 10, 1, 0)
+			rightHandle.Position = UDim2.new(1, -10, 0, 0)
+			rightHandle.BackgroundColor3 = Color3.new(1, 1, 1)
+			rightHandle.BackgroundTransparency = 0.6
+			rightHandle.BorderSizePixel = 0
+			rightHandle.Active = true
+			rightHandle.ZIndex = 5
+			rightHandle.Parent = block
 
-			-- Double-click to edit
+			local leftHandle = Instance.new("Frame")
+			leftHandle.Size = UDim2.new(0, 10, 1, 0)
+			leftHandle.Position = UDim2.new(0, 0, 0, 0)
+			leftHandle.BackgroundColor3 = Color3.new(1, 1, 1)
+			leftHandle.BackgroundTransparency = 0.6
+			leftHandle.BorderSizePixel = 0
+			leftHandle.Active = true
+			leftHandle.ZIndex = 5
+			leftHandle.Parent = block
+
 			local idx = i
-			block.MouseButton1Click:Connect(function()
-				local now = os.clock()
-				if lastClickIndex == idx and (now - lastClickTime) < 0.4 then
-					-- Double-click: open edit popup
-					editBox.Text = prompt.text
-					editPopup.Position = UDim2.new(0, math.floor(startPx), 0, Constants.RULER_HEIGHT - 2)
-					editPopup.Size = UDim2.new(0, math.max(200, math.floor(width)), 0, 30)
-					editPopup.Visible = true
-					editingIndex = idx
-					editBox:CaptureFocus()
+
+			-- Drag edges (parent block handles move+release)
+			rightHandle.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					draggingPromptIdx = idx
+					draggingPromptEdge = "right"
 				end
-				lastClickTime = now
-				lastClickIndex = idx
 			end)
 
-			-- Right-click to delete
-			block.MouseButton2Click:Connect(function()
-				local updated = table.clone(appState.prompts:get())
-				table.remove(updated, idx)
-				appState.prompts:set(updated)
+			leftHandle.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					draggingPromptIdx = idx
+					draggingPromptEdge = "left"
+				end
+			end)
+
+			-- Handle drag movement on block (handles disable Active, so block gets events)
+			block.InputChanged:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseMovement and draggingPromptIdx then
+					local relX = input.Position.X - promptTrack.AbsolutePosition.X
+					local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
+					local maxT = appState.duration:get()
+					if maxT <= 0 and playbackSvc then maxT = playbackSvc:getDuration() end
+					if maxT <= 0 then maxT = 10 end
+					time = math.clamp(time, 0, maxT)
+					local updated = table.clone(appState.prompts:get())
+					if draggingPromptIdx <= #updated then
+						updated[draggingPromptIdx] = table.clone(updated[draggingPromptIdx])
+						if draggingPromptEdge == "right" then
+							updated[draggingPromptIdx].endTime = math.max(time, updated[draggingPromptIdx].startTime + 0.2)
+						elseif draggingPromptEdge == "left" then
+							updated[draggingPromptIdx].startTime = math.min(time, updated[draggingPromptIdx].endTime - 0.2)
+						end
+						appState.prompts:set(updated)
+					end
+				end
+			end)
+
+			block.InputEnded:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					draggingPromptIdx = nil
+					draggingPromptEdge = nil
+					renderPromptBlocks() -- rebuild now that drag is over
+				end
+			end)
+
+			-- Double-click body to edit, right-click to delete
+			block.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					local now = os.clock()
+					if lastClickIndex == idx and (now - lastClickTime) < 0.4 then
+						editBox.Text = prompt.text
+						editPopup.Position = UDim2.new(0, math.floor(startPx), 0, Constants.RULER_HEIGHT - 2)
+						editPopup.Size = UDim2.new(0, math.max(200, math.floor(width)), 0, 30)
+						editPopup.Visible = true
+						editingIndex = idx
+						editBox:CaptureFocus()
+					end
+					lastClickTime = now
+					lastClickIndex = idx
+				elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+					local updated = table.clone(appState.prompts:get())
+					table.remove(updated, idx)
+					appState.prompts:set(updated)
+				end
 			end)
 
 			table.insert(promptBlocks, block)
 		end
 	end
 
+
+	-- Drag overlay: full-size invisible button that captures input while dragging.
+	-- Only visible during active drags — ensures mouse-up is always caught.
 	appState.prompts:subscribe(renderPromptBlocks)
 	appState.pixelsPerSecond:subscribe(renderPromptBlocks)
 	appState.scrollOffset:subscribe(renderPromptBlocks)
 
-	-- Constraint diamond rendering on timeline
-	local constraintDiamonds: { Frame } = {}
-
-	local function renderConstraints()
+	-- Constraint diamond rendering on timeline (draggable to change time)
+	renderConstraints = function()
+		if draggingConstraint then return end -- don't rebuild while dragging
 		for _, d in constraintDiamonds do
 			d:Destroy()
 		end
@@ -804,33 +992,48 @@ local function buildUI()
 			if not effTrack then continue end
 
 			local px = (constraint.time - scroll) * pps
-			local diamond = Instance.new("TextButton")
+			local diamond = Instance.new("Frame")
 			diamond.Name = "C_" .. constraint.effector .. "_" .. tostring(i)
-			diamond.Size = UDim2.new(0, 10, 0, 10)
-			diamond.Position = UDim2.new(0, math.floor(px) - 5, 0.5, -5)
+			diamond.Size = UDim2.new(0, 16, 0, 16)
+			diamond.Position = UDim2.new(0, math.floor(px) - 8, 0.5, -8)
 			diamond.BackgroundColor3 = Constants.EFFECTOR_COLORS[constraint.effector] or Color3.new(1, 1, 1)
-			diamond.Rotation = 45
-			diamond.BorderSizePixel = 0
-			diamond.AutoButtonColor = false
-			diamond.Text = ""
+			diamond.Rotation = 0
+			diamond.Active = true
+			diamond.ZIndex = 5
 			diamond.Parent = effTrack
+			local diamondCorner = Instance.new("UICorner")
+			diamondCorner.CornerRadius = UDim.new(0, 3)
+			diamondCorner.Parent = diamond
+
+			local idx = i
+
+			-- Left-click to start drag (parent track handles move+release)
+			diamond.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					draggingConstraint = idx
+				end
+			end)
 
 			-- Right-click to delete constraint (and its chain)
-			local idx = i
-			diamond.MouseButton2Click:Connect(function()
-				local updated = table.clone(appState.constraints:get())
-				local removed = table.remove(updated, idx)
-				if removed then
-					if removed.chain and type(removed.chain) == "table" and removed.chain.model then
-						RigService.destroyChain(removed.chain)
+			diamond.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton2 then
+					local updated = table.clone(appState.constraints:get())
+					local removed = table.remove(updated, idx)
+					if removed then
+						if removed.chain and type(removed.chain) == "table" and removed.chain.model then
+							RigService.destroyChain(removed.chain)
+						end
 					end
+					appState.constraints:set(updated)
 				end
-				appState.constraints:set(updated)
 			end)
 
 			table.insert(constraintDiamonds, diamond)
 		end
 	end
+
+	-- Handle constraint diamond dragging
+
 
 	appState.constraints:subscribe(renderConstraints)
 	appState.pixelsPerSecond:subscribe(renderConstraints)
@@ -929,6 +1132,11 @@ local function onSelectionChanged()
 	if #selected == 1 then
 		local rig = RigService.findRig(selected[1])
 		if rig then
+			-- Don't reset if it's the same rig we already have
+			local currentRig = appState.rig:get()
+			if currentRig and currentRig.model == rig.model then
+				return
+			end
 			appState.rig:set(rig)
 			if playbackSvc then
 				playbackSvc:destroy()

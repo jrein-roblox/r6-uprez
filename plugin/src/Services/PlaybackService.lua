@@ -56,6 +56,12 @@ function PlaybackService:loadFromCurveAnimation(curveAnim: CurveAnimation): bool
 
 	self._track = result
 	self._duration = result.Length
+	if self._duration <= 0 then
+		self._duration = 3.0
+	end
+	-- Start paused so scrubbing works immediately
+	self._track:Play(0, 1, 0)
+	self._state = "paused"
 	return true
 end
 
@@ -150,13 +156,16 @@ function PlaybackService:seekTo(time: number)
 	if not self._track then
 		return
 	end
-	-- Ensure the track is loaded and can be scrubbed even when "stopped"
 	if self._state == "stopped" then
-		self._track:Play(0, 1, 0) -- play at speed 0 (paused but active)
+		self._track:Play(0, 1, 0)
 		self._state = "paused"
 	elseif self._state == "playing" then
 		self._track:AdjustSpeed(0)
 		self._state = "paused"
+		if self._renderConn then
+			self._renderConn:Disconnect()
+			self._renderConn = nil
+		end
 	end
 	self._track.TimePosition = math.clamp(time, 0, self._duration)
 	self._rig.animator:StepAnimations(0)
