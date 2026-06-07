@@ -167,9 +167,11 @@ function PlaybackService:seekTo(time: number)
 			self._renderConn = nil
 		end
 	end
+	-- Clamp to track for the actual animation, but report unclamped time
+	-- so the playhead can be positioned beyond the animation end
 	self._track.TimePosition = math.clamp(time, 0, self._duration)
 	self._rig.animator:StepAnimations(0)
-	self.TimeChanged:Fire(self._track.TimePosition)
+	self.TimeChanged:Fire(time)
 end
 
 function PlaybackService:getDuration(): number

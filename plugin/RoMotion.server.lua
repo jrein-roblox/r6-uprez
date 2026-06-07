@@ -49,6 +49,9 @@ widget.Name = Constants.WIDGET_ID
 -- App State
 -- ════════════════════════════════════════════════════════════════════
 
+-- Ground Y from rig's REST pose (computed once on rig selection, never changes)
+local rigRestGroundY = 0
+
 local appState = {
 	rig = State.new(nil :: RigService.RigInfo?),
 	projectName = State.new("Untitled"),
@@ -540,33 +543,15 @@ local function buildUI()
 					})
 				end
 
-				-- Compute ground level from the rig's actual foot positions
-				local lFoot = rig.model:FindFirstChild("LeftFoot", true) :: BasePart?
-				local rFoot = rig.model:FindFirstChild("RightFoot", true) :: BasePart?
-				local groundY = 0
-				if lFoot and rFoot then
-					groundY = math.min(
-						lFoot.Position.Y - lFoot.Size.Y / 2,
-						rFoot.Position.Y - rFoot.Size.Y / 2
-					)
-				elseif lFoot then
-					groundY = lFoot.Position.Y - lFoot.Size.Y / 2
-				end
-
+				-- XZ: HRP center (stable). Y: floor level (Kimodo Y=0 = floor).
+				-- rigRestGroundY is computed once at rig selection (stable).
 				local hrpPos = rig.rootPart.Position
 				local _, hrpYaw, _ = rig.rootPart.CFrame:ToEulerAnglesYXZ()
-				local groundCF = CFrame.new(hrpPos.X, groundY, hrpPos.Z)
+				local groundCF = CFrame.new(hrpPos.X, rigRestGroundY, hrpPos.Z)
 					* CFrame.fromEulerAnglesYXZ(0, hrpYaw, 0)
 
-				-- Root position: HRP XZ (stable anchor) + LowerTorso Y (height).
-				-- HRP doesn't move with animation, prevents drift across iterations.
-				local ltPart = rig.model:FindFirstChild("LowerTorso", true) :: BasePart?
-				local rootLocalPos = { 0, 0, 0 }
-				if ltPart then
-					local ltY = ltPart.Position.Y - groundY
-					-- XZ = 0 relative to character center (HRP is the anchor)
-					rootLocalPos = { 0, ltY, 0 }
-				end
+				-- Root position is no longer used separately — it comes from the
+				-- chain's LowerTorso position (relative to HRP) via chain_world_cframes
 
 				-- Ensure animation is active so rig parts are at animated positions
 				if playbackSvc then
@@ -587,10 +572,17 @@ local function buildUI()
 					})
 				end
 
+				-- Compute duration from prompt segments (authoritative)
+				local totalDuration = 0
+				for _, seg in promptSegments do
+					totalDuration += (seg.end_time - seg.start_time)
+				end
+				appState.duration:set(totalDuration)
+
 				local resp = BackendService.generate({
 					prompts = promptSegments,
 					constraints = constraintsList,
-					duration = appState.duration:get(),
+					duration = totalDuration,
 					looped = appState.looped:get(),
 					seed = if appState.seed:get() > 0 then appState.seed:get() else nil,
 				})
@@ -684,11 +676,10 @@ local function buildUI()
 	local function scrubToInput(input: InputObject)
 		local relX = input.Position.X - timelineFrame.AbsolutePosition.X
 		local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-		local maxTime = appState.duration:get()
-		if maxTime <= 0 and playbackSvc then
-			maxTime = playbackSvc:getDuration()
-		end
-		if maxTime <= 0 then maxTime = 10 end
+		local prompts_val = appState.prompts:get()
+		local promptEnd = if #prompts_val > 0 then prompts_val[#prompts_val].endTime else 0
+		local trackEnd = if playbackSvc then playbackSvc:getDuration() else 0
+		local maxTime = math.max(promptEnd, trackEnd, 1)
 		time = math.clamp(time, 0, maxTime)
 		appState.playbackTime:set(time)
 		if playbackSvc then
@@ -748,6 +739,7 @@ local function buildUI()
 	mainFrame.Active = true
 
 	-- Listen on ALL relevant areas for movement
+	ruler.InputChanged:Connect(onDragMove)
 	timelineFrame.InputChanged:Connect(onDragMove)
 	promptTrack.InputChanged:Connect(onDragMove)
 	constraintArea.InputChanged:Connect(onDragMove)
@@ -824,34 +816,33 @@ local function buildUI()
 		editingIndex = nil
 	end)
 
-	-- Prompt block rendering
-	local promptBlocks: { Frame } = {}
+	-- Contiguous prompt blocks: no gaps, no overlaps. Drag boundaries to resize.
+	local promptElements: { Instance } = {}
 	local lastClickTime = 0
-	local lastClickIndex = 0
-	local draggingPromptIdx: number? = nil
-	local draggingPromptEdge: string? = nil -- "left" or "right"
+	local lastClickBlock = 0
+	local draggingBoundary: number? = nil -- index of left block at this boundary
 
 	local function renderPromptBlocks()
-		if draggingPromptIdx then return end -- don't rebuild while dragging
-		for _, block in promptBlocks do
-			block:Destroy()
+		if draggingBoundary then return end
+		for _, el in promptElements do
+			el:Destroy()
 		end
-		table.clear(promptBlocks)
+		table.clear(promptElements)
 
 		local prompts_val = appState.prompts:get()
 		local pps = appState.pixelsPerSecond:get()
 		local scroll = appState.scrollOffset:get()
 
+		-- Render blocks
+		local x = 0
 		for i, prompt in prompts_val do
-			local startPx = (prompt.startTime - scroll) * pps
-			local endPx = (prompt.endTime - scroll) * pps
-			local width = endPx - startPx
-
-			if width < 2 then continue end
+			local dur = prompt.endTime - prompt.startTime
+			local startPx = (x - scroll) * pps
+			local w = dur * pps
 
 			local block = Instance.new("Frame")
 			block.Name = "Prompt_" .. tostring(i)
-			block.Size = UDim2.new(0, math.floor(width), 1, -4)
+			block.Size = UDim2.new(0, math.floor(w), 1, -4)
 			block.Position = UDim2.new(0, math.floor(startPx), 0, 2)
 			block.BackgroundColor3 = Constants.PROMPT_COLORS[((i - 1) % #Constants.PROMPT_COLORS) + 1]
 			block.BackgroundTransparency = 0.3
@@ -864,113 +855,208 @@ local function buildUI()
 			rc.Parent = block
 
 			local lbl = Instance.new("TextLabel")
-			lbl.Size = UDim2.new(1, -12, 1, 0)
-			lbl.Position = UDim2.new(0, 6, 0, 0)
+			lbl.Size = UDim2.fromScale(1, 1)
 			lbl.BackgroundTransparency = 1
 			lbl.Text = prompt.text
 			lbl.TextColor3 = Color3.new(1, 1, 1)
 			lbl.TextSize = 11
 			lbl.Font = Enum.Font.SourceSans
 			lbl.TextTruncate = Enum.TextTruncate.AtEnd
-			lbl.TextXAlignment = Enum.TextXAlignment.Left
+			lbl.TextXAlignment = Enum.TextXAlignment.Center
 			lbl.Parent = block
 
-			-- Right edge handle for resizing
-			local rightHandle = Instance.new("Frame")
-			rightHandle.Size = UDim2.new(0, 10, 1, 0)
-			rightHandle.Position = UDim2.new(1, -10, 0, 0)
-			rightHandle.BackgroundColor3 = Color3.new(1, 1, 1)
-			rightHandle.BackgroundTransparency = 0.6
-			rightHandle.BorderSizePixel = 0
-			rightHandle.Active = true
-			rightHandle.ZIndex = 5
-			rightHandle.Parent = block
-
-			local leftHandle = Instance.new("Frame")
-			leftHandle.Size = UDim2.new(0, 10, 1, 0)
-			leftHandle.Position = UDim2.new(0, 0, 0, 0)
-			leftHandle.BackgroundColor3 = Color3.new(1, 1, 1)
-			leftHandle.BackgroundTransparency = 0.6
-			leftHandle.BorderSizePixel = 0
-			leftHandle.Active = true
-			leftHandle.ZIndex = 5
-			leftHandle.Parent = block
-
+			-- Double-click to edit text, right-click to delete
 			local idx = i
-
-			-- Drag edges (parent block handles move+release)
-			rightHandle.InputBegan:Connect(function(input)
-				if input.UserInputType == Enum.UserInputType.MouseButton1 then
-					draggingPromptIdx = idx
-					draggingPromptEdge = "right"
-				end
-			end)
-
-			leftHandle.InputBegan:Connect(function(input)
-				if input.UserInputType == Enum.UserInputType.MouseButton1 then
-					draggingPromptIdx = idx
-					draggingPromptEdge = "left"
-				end
-			end)
-
-			-- Handle drag movement on block (handles disable Active, so block gets events)
-			block.InputChanged:Connect(function(input)
-				if input.UserInputType == Enum.UserInputType.MouseMovement and draggingPromptIdx then
-					local relX = input.Position.X - promptTrack.AbsolutePosition.X
-					local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-					local maxT = appState.duration:get()
-					if maxT <= 0 and playbackSvc then maxT = playbackSvc:getDuration() end
-					if maxT <= 0 then maxT = 10 end
-					time = math.clamp(time, 0, maxT)
-					local updated = table.clone(appState.prompts:get())
-					if draggingPromptIdx <= #updated then
-						updated[draggingPromptIdx] = table.clone(updated[draggingPromptIdx])
-						if draggingPromptEdge == "right" then
-							updated[draggingPromptIdx].endTime = math.max(time, updated[draggingPromptIdx].startTime + 0.2)
-						elseif draggingPromptEdge == "left" then
-							updated[draggingPromptIdx].startTime = math.min(time, updated[draggingPromptIdx].endTime - 0.2)
-						end
-						appState.prompts:set(updated)
-					end
-				end
-			end)
-
-			block.InputEnded:Connect(function(input)
-				if input.UserInputType == Enum.UserInputType.MouseButton1 then
-					draggingPromptIdx = nil
-					draggingPromptEdge = nil
-					renderPromptBlocks() -- rebuild now that drag is over
-				end
-			end)
-
-			-- Double-click body to edit, right-click to delete
 			block.InputBegan:Connect(function(input)
 				if input.UserInputType == Enum.UserInputType.MouseButton1 then
 					local now = os.clock()
-					if lastClickIndex == idx and (now - lastClickTime) < 0.4 then
+					if lastClickBlock == idx and (now - lastClickTime) < 0.4 then
 						editBox.Text = prompt.text
 						editPopup.Position = UDim2.new(0, math.floor(startPx), 0, Constants.RULER_HEIGHT - 2)
-						editPopup.Size = UDim2.new(0, math.max(200, math.floor(width)), 0, 30)
+						editPopup.Size = UDim2.new(0, math.max(200, math.floor(w)), 0, 30)
 						editPopup.Visible = true
 						editingIndex = idx
 						editBox:CaptureFocus()
 					end
 					lastClickTime = now
-					lastClickIndex = idx
+					lastClickBlock = idx
 				elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
-					local updated = table.clone(appState.prompts:get())
-					table.remove(updated, idx)
-					appState.prompts:set(updated)
+					if #prompts_val > 1 then
+						local updated = table.clone(prompts_val)
+						table.remove(updated, idx)
+						-- Recalculate times to stay contiguous
+						local t = 0
+						for j, p in updated do
+							local d = p.endTime - p.startTime
+							updated[j] = table.clone(p)
+							updated[j].startTime = t
+							updated[j].endTime = t + d
+							t += d
+						end
+						appState.prompts:set(updated)
+						appState.duration:set(t)
+					end
 				end
 			end)
 
-			table.insert(promptBlocks, block)
+			table.insert(promptElements, block)
+			x += dur
+		end
+
+		-- Render boundaries between blocks
+		x = 0
+		for i = 1, #prompts_val do
+			x += prompts_val[i].endTime - prompts_val[i].startTime
+			-- Boundary after each block (internal dividers + last edge)
+			local isLast = (i == #prompts_val)
+			local boundary = Instance.new("Frame")
+			boundary.Name = "Boundary_" .. tostring(i)
+			boundary.Size = UDim2.new(0, 8, 1, 0)
+			boundary.Position = UDim2.new(0, math.floor((x - scroll) * pps) - 4, 0, 0)
+			boundary.BackgroundColor3 = if isLast then Color3.fromRGB(255, 120, 120) else Color3.new(1, 1, 1)
+			boundary.BackgroundTransparency = 0.5
+			boundary.BorderSizePixel = 0
+			boundary.Active = true
+			boundary.ZIndex = 5
+			boundary.Parent = promptTrack
+
+			local bIdx = i
+			boundary.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					draggingBoundary = bIdx
+					boundary.BackgroundTransparency = 0
+				end
+			end)
+
+			table.insert(promptElements, boundary)
 		end
 	end
 
+	-- Drag movement for prompt boundaries
+	promptTrack.InputChanged:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+		if not draggingBoundary then return end
 
-	-- Drag overlay: full-size invisible button that captures input while dragging.
-	-- Only visible during active drags — ensures mouse-up is always caught.
+		local relX = input.Position.X - promptTrack.AbsolutePosition.X
+		local pps = appState.pixelsPerSecond:get()
+		local scroll = appState.scrollOffset:get()
+		local time = relX / pps + scroll
+
+		local prompts_val = appState.prompts:get()
+		local isLast = (draggingBoundary == #prompts_val)
+
+		if isLast then
+			-- Drag last edge: extend/shrink last block
+			local beforeStart = prompts_val[#prompts_val].startTime
+			local newDur = math.max(0.3, time - beforeStart)
+			-- Update visual directly
+			local lastBlock = promptElements[#prompts_val]
+			local lastBoundary = promptElements[#promptElements]
+			if lastBlock and lastBlock:IsA("Frame") then
+				lastBlock.Size = UDim2.new(0, math.floor(newDur * pps), 1, -4)
+			end
+			if lastBoundary and lastBoundary:IsA("Frame") then
+				lastBoundary.Position = UDim2.new(0, math.floor((beforeStart + newDur - scroll) * pps) - 4, 0, 0)
+			end
+		else
+			-- Internal boundary: resize blocks[idx] and blocks[idx+1]
+			local beforeStart = prompts_val[draggingBoundary].startTime
+			local afterEnd = prompts_val[draggingBoundary + 1].endTime
+			time = math.clamp(time, beforeStart + 0.3, afterEnd - 0.3)
+
+			local newDur1 = time - beforeStart
+			local newDur2 = afterEnd - time
+
+			-- Update visuals directly
+			local block1 = promptElements[draggingBoundary]
+			local block2 = promptElements[draggingBoundary + 1]
+			local boundary = promptElements[#appState.prompts:get() + draggingBoundary]
+			if block1 and block1:IsA("Frame") then
+				block1.Size = UDim2.new(0, math.floor(newDur1 * pps), 1, -4)
+			end
+			if block2 and block2:IsA("Frame") then
+				block2.Position = UDim2.new(0, math.floor((time - scroll) * pps), 0, 2)
+				block2.Size = UDim2.new(0, math.floor(newDur2 * pps), 1, -4)
+			end
+			if boundary and boundary:IsA("Frame") then
+				boundary.Position = UDim2.new(0, math.floor((time - scroll) * pps) - 4, 0, 0)
+			end
+		end
+	end)
+
+	-- Release: update state and re-render
+	promptTrack.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and draggingBoundary then
+			local relX = input.Position.X - promptTrack.AbsolutePosition.X
+			local pps = appState.pixelsPerSecond:get()
+			local scroll = appState.scrollOffset:get()
+			local time = relX / pps + scroll
+
+			local prompts_val = appState.prompts:get()
+			local updated = table.clone(prompts_val)
+			local isLast = (draggingBoundary == #prompts_val)
+
+			if isLast then
+				local beforeStart = updated[#updated].startTime
+				local newDur = math.max(0.3, time - beforeStart)
+				updated[#updated] = table.clone(updated[#updated])
+				updated[#updated].endTime = beforeStart + newDur
+				appState.duration:set(beforeStart + newDur)
+			else
+				local beforeStart = updated[draggingBoundary].startTime
+				local afterEnd = updated[draggingBoundary + 1].endTime
+				time = math.clamp(time, beforeStart + 0.3, afterEnd - 0.3)
+				updated[draggingBoundary] = table.clone(updated[draggingBoundary])
+				updated[draggingBoundary].endTime = time
+				updated[draggingBoundary + 1] = table.clone(updated[draggingBoundary + 1])
+				updated[draggingBoundary + 1].startTime = time
+			end
+
+			draggingBoundary = nil
+			appState.prompts:set(updated)
+		end
+	end)
+
+	-- Add block button: click to append a new 2s prompt segment
+	local addBlockBtn = Instance.new("TextButton")
+	addBlockBtn.Name = "AddBlock"
+	addBlockBtn.Size = UDim2.new(0, 24, 0, 24)
+	addBlockBtn.Position = UDim2.new(0, 0, 0, 0) -- updated by renderPromptBlocks
+	addBlockBtn.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Button)
+	addBlockBtn.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.ButtonText)
+	addBlockBtn.Text = "+"
+	addBlockBtn.TextSize = 16
+	addBlockBtn.Font = Enum.Font.SourceSansBold
+	addBlockBtn.ZIndex = 5
+	addBlockBtn.Parent = promptTrack
+	local addCorner = Instance.new("UICorner")
+	addCorner.CornerRadius = UDim.new(0, 4)
+	addCorner.Parent = addBlockBtn
+
+	addBlockBtn.MouseButton1Click:Connect(function()
+		local prompts_val = appState.prompts:get()
+		local updated = table.clone(prompts_val)
+		local lastEnd = if #updated > 0 then updated[#updated].endTime else 0
+		table.insert(updated, {
+			text = "describe motion",
+			startTime = lastEnd,
+			endTime = lastEnd + 2.0,
+		})
+		appState.duration:set(lastEnd + 2.0)
+		appState.prompts:set(updated)
+	end)
+
+	-- Position the + button after rendering
+	local origRender = renderPromptBlocks
+	renderPromptBlocks = function()
+		origRender()
+		local prompts_val = appState.prompts:get()
+		local totalDur = if #prompts_val > 0 then prompts_val[#prompts_val].endTime else 0
+		local pps = appState.pixelsPerSecond:get()
+		local scroll = appState.scrollOffset:get()
+		addBlockBtn.Position = UDim2.new(0, math.floor((totalDur - scroll) * pps) + 8, 0.5, -12)
+	end
+
 	appState.prompts:subscribe(renderPromptBlocks)
 	appState.pixelsPerSecond:subscribe(renderPromptBlocks)
 	appState.scrollOffset:subscribe(renderPromptBlocks)
@@ -1138,6 +1224,14 @@ local function onSelectionChanged()
 				return
 			end
 			appState.rig:set(rig)
+			-- Compute rest-pose ground Y (rig is at rest when first selected)
+			local lf = rig.model:FindFirstChild("LeftFoot", true) :: BasePart?
+			local rf = rig.model:FindFirstChild("RightFoot", true) :: BasePart?
+			if lf and rf then
+				rigRestGroundY = math.min(lf.Position.Y - lf.Size.Y/2, rf.Position.Y - rf.Size.Y/2)
+			elseif lf then
+				rigRestGroundY = lf.Position.Y - lf.Size.Y/2
+			end
 			if playbackSvc then
 				playbackSvc:destroy()
 			end
@@ -1202,7 +1296,7 @@ task.defer(function()
 	if #appState.prompts:get() == 0 then
 		appState.prompts:set({
 			{
-				text = "a person walking forward",
+				text = "a person waving",
 				startTime = 0,
 				endTime = appState.duration:get(),
 			},

@@ -71,14 +71,16 @@ EFF_MAP = {
     "RightHand": ("right-hand", "RightHand"),
 }
 
-# Position scale: XZ corrected for retarget's hrp_scale round-trip
+# Position scale:
+# XZ: HRP-relative, corrected for retarget's hrp_scale amplification
+# Y: FLOOR-relative, direct stud→meter (Kimodo Y=0 = floor, matching pipeline)
 CM_TO_STUD = 0.03
 STUD_TO_METER = 0.30
 SOMA_BIND_CHAIN = 2.643  # soma bind hip-to-ankle in studs
 TARGET_CHAIN = 3.6693    # Rthro HRP-to-ankle studs
 HRP_SCALE = TARGET_CHAIN / SOMA_BIND_CHAIN  # ~1.388
-STUD_TO_KIMODO_XZ = 1.0 / (100.0 * CM_TO_STUD * HRP_SCALE)  # ~0.24
-STUD_TO_KIMODO_Y = STUD_TO_METER  # 0.30
+STUD_TO_KIMODO_XZ = 1.0 / (100.0 * CM_TO_STUD * HRP_SCALE)  # ~0.24 (XZ round-trip)
+STUD_TO_KIMODO_Y = STUD_TO_METER  # 0.30 (Y: floor-relative, Kimodo Y=0=floor)
 
 
 def build_kimodo_constraints(constraints: List[Constraint], total_duration: float):
