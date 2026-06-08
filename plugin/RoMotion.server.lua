@@ -69,6 +69,7 @@ local appState = {
 	selectedConstraints = State.new({} :: { number }), -- indices into constraints
 	looped = State.new(false),
 	loopOffset = State.new(0),
+	constraintsVisible = State.new(true),
 	seed = State.new(0),
 	serverConnected = State.new(false),
 }
@@ -475,6 +476,21 @@ local function buildUI()
 
 	local importBtn = makeButton("Import", "Import")
 	importBtn.Size = UDim2.new(0, 56, 0, 26)
+
+	-- Toggle constraint visibility (parts + number labels)
+	local visBtn = makeButton("ToggleVis", "Hide")
+	visBtn.Size = UDim2.new(0, 48, 0, 26)
+	visBtn.MouseButton1Click:Connect(function()
+		appState.constraintsVisible:set(not appState.constraintsVisible:get())
+	end)
+	appState.constraintsVisible:subscribe(function(visible)
+		visBtn.Text = if visible then "Hide" else "Show"
+		for _, c in appState.constraints:get() do
+			if c.chain and type(c.chain) == "table" and c.chain.parts then
+				RigService.setChainVisible(c.chain, visible)
+			end
+		end
+	end)
 
 	-- ─── Timeline Area ───
 	local timelineFrame = Instance.new("Frame")
@@ -1360,9 +1376,10 @@ local function buildUI()
 			numLbl.ZIndex = 6
 			numLbl.Parent = diamond
 
-			-- Update the matching world chain marker (number + hue)
+			-- Update the matching world chain marker (number + hue + visibility)
 			if constraint.chain and type(constraint.chain) == "table" and constraint.chain.parts then
 				RigService.labelChain(constraint.chain, constraint.effector, ordinal, color)
+				RigService.setChainVisible(constraint.chain, appState.constraintsVisible:get())
 			end
 
 			local idx = i

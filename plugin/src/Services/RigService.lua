@@ -424,6 +424,20 @@ function RigService.labelChain(chain: ChainData, effector: string, ordinal: numb
 	end
 end
 
+-- Show or hide all of a chain's visuals (parts + number billboard + outline).
+function RigService.setChainVisible(chain: ChainData, visible: boolean)
+	for _, part in chain.parts do
+		part.Transparency = if visible then 0.5 else 1
+		for _, child in part:GetChildren() do
+			if child:IsA("BillboardGui") then
+				child.Enabled = visible
+			elseif child:IsA("SelectionBox") then
+				child.Visible = visible
+			end
+		end
+	end
+end
+
 function RigService.destroyChain(chain: ChainData)
 	for _, conn in chain.connections do
 		conn:Disconnect()
