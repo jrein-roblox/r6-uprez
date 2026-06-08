@@ -80,8 +80,12 @@ CM_TO_STUD = 0.03
 STUD_TO_METER = 0.30
 SOMA_BIND_CHAIN = 2.643
 TARGET_CHAIN = 3.6693
-HRP_SCALE = TARGET_CHAIN / SOMA_BIND_CHAIN  # ~1.388
-STUD_TO_KIMODO_XZ = 1.0 / (100.0 * CM_TO_STUD * HRP_SCALE)  # ~0.24
+# Geometric value is TARGET_CHAIN / SOMA_BIND_CHAIN ≈ 1.388. Overridden to 1.1
+# experimentally to reduce foot sliding (lower scale = less root XZ travel per
+# leg swing). Used for BOTH the retarget AND the constraint XZ round-trip so
+# constraints still land where placed.
+HRP_SCALE = 1.1
+STUD_TO_KIMODO_XZ = 1.0 / (100.0 * CM_TO_STUD * HRP_SCALE)  # ≈0.303 at scale 1.1
 STUD_TO_KIMODO_Y = STUD_TO_METER  # 0.30
 
 
@@ -277,14 +281,13 @@ def generate(req: GenerateRequest):
         job.progress = 0.7
         bvh_path = clip_dir / "generated.bvh"
         export_r15.set_rig(parent_pipeline.RIG if req.target_rig == "r15" else "r15plus")
-        soma_bind = prompt_pipeline._soma_bind_hip_to_ankle_studs()
         hrp_to_ankle = prompt_pipeline._RTHRO_HRP_TO_ANKLE
         parent_pipeline._retarget_bvh_to_r15_json(
             bvh_path, r15_json_path,
             root_motion=False, source_n_frames=0, loop_passes=1,
             looped=req.looped,
             inertial_blend_frames=6 if req.looped else 0,
-            hrp_scale=hrp_to_ankle / soma_bind,
+            hrp_scale=HRP_SCALE,  # experimental override (see top of file)
             target_rig=req.target_rig,
         )
         result = json.loads(r15_json_path.read_text())
