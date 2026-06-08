@@ -68,6 +68,7 @@ local appState = {
 	pixelsPerSecond = State.new(100),
 	selectedConstraints = State.new({} :: { number }), -- indices into constraints
 	looped = State.new(false),
+	loopOffset = State.new(0),
 	seed = State.new(0),
 	serverConnected = State.new(false),
 }
@@ -395,6 +396,56 @@ local function buildUI()
 	generateBtn.Size = UDim2.new(0, 80, 0, 26)
 	generateBtn.TextColor3 = Color3.new(1, 1, 1)
 
+	-- Loop toggle (two-pass loop synthesis + inertial blend)
+	local loopBtn = makeButton("Loop", "Loop")
+	loopBtn.Size = UDim2.new(0, 48, 0, 26)
+	local function refreshLoopBtn()
+		if appState.looped:get() then
+			loopBtn.BackgroundColor3 = Color3.fromRGB(76, 175, 80)
+			loopBtn.TextColor3 = Color3.new(1, 1, 1)
+		else
+			loopBtn.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Button)
+			loopBtn.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.ButtonText)
+		end
+	end
+	loopBtn.MouseButton1Click:Connect(function()
+		appState.looped:set(not appState.looped:get())
+	end)
+	appState.looped:subscribe(refreshLoopBtn)
+	refreshLoopBtn()
+
+	-- Loop pivot offset (seconds into the clip to use as the loop pose).
+	-- Only relevant when looping; lets you avoid an idle start/end pose.
+	local loopOffsetInput = Instance.new("TextBox")
+	loopOffsetInput.Name = "LoopOffset"
+	loopOffsetInput.Size = UDim2.new(0, 40, 0, 26)
+	loopOffsetInput.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+	loopOffsetInput.BorderColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Border)
+	loopOffsetInput.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+	loopOffsetInput.Text = "0.0"
+	loopOffsetInput.PlaceholderText = "pivot s"
+	loopOffsetInput.TextSize = 12
+	loopOffsetInput.Font = Enum.Font.Code
+	loopOffsetInput.ClearTextOnFocus = false
+	loopOffsetInput.Parent = toolBar
+	local loCorner = Instance.new("UICorner")
+	loCorner.CornerRadius = UDim.new(0, 3)
+	loCorner.Parent = loopOffsetInput
+	loopOffsetInput.FocusLost:Connect(function()
+		local v = tonumber(loopOffsetInput.Text)
+		if v and v >= 0 then
+			appState.loopOffset:set(v)
+		else
+			loopOffsetInput.Text = string.format("%.1f", appState.loopOffset:get())
+		end
+	end)
+	-- Only show the offset field when looping is on
+	local function refreshLoopOffsetVis()
+		loopOffsetInput.Visible = appState.looped:get()
+	end
+	appState.looped:subscribe(refreshLoopOffsetVis)
+	refreshLoopOffsetVis()
+
 	-- Progress label
 	local progressLabel = Instance.new("TextLabel")
 	progressLabel.Name = "ProgressLabel"
@@ -562,7 +613,7 @@ local function buildUI()
 	local playhead = Instance.new("Frame")
 	playhead.Name = "Playhead"
 	playhead.Size = UDim2.new(0, 2, 1, 0)
-	playhead.Position = UDim2.new(0, 0, 0, 0)
+	playhead.Position = UDim2.new(0, GUTTER, 0, 0) -- time 0 sits at the gutter edge
 	playhead.BackgroundColor3 = Constants.PLAYHEAD_COLOR
 	playhead.BorderSizePixel = 0
 	playhead.ZIndex = 10
@@ -586,7 +637,7 @@ local function buildUI()
 
 	appState.playbackTime:subscribe(function(t)
 		timeLabel.Text = string.format("%.3fs", t)
-		playhead.Position = UDim2.new(0, math.floor(timeToPx(t)), 0, 0)
+		playhead.Position = UDim2.new(0, math.max(GUTTER, math.floor(timeToPx(t))), 0, 0)
 	end)
 
 	appState.generationStatus:subscribe(function(status)
@@ -700,6 +751,7 @@ local function buildUI()
 					constraints = constraintsList,
 					duration = totalDuration,
 					looped = appState.looped:get(),
+					loop_offset = appState.loopOffset:get(),
 					seed = if appState.seed:get() > 0 then appState.seed:get() else nil,
 				})
 
@@ -746,8 +798,9 @@ local function buildUI()
 						end
 						break
 					elseif status.status == "failed" then
+						warn("[RoMotion] Server generation failed:\n" .. tostring(status.error or "(no detail)"))
 						appState.generationStatus:set("failed")
-						appState.generationMessage:set(status.error or "Generation failed")
+						appState.generationMessage:set("Failed (see Output)")
 						break
 					end
 				end
@@ -771,7 +824,7 @@ local function buildUI()
 		task.spawn(function()
 			local fps = Constants.FPS
 			local duration = playbackSvc:getDuration()
-			local nFrames = math.max(3, math.floor(duration * fps))
+			local nFrames = math.max(3, math.floor(duration * fps + 0.5))
 			local effectors = { "LeftHand", "RightHand", "LeftFoot", "RightFoot" }
 			local hrpInv = rig.rootPart.CFrame:Inverse()
 

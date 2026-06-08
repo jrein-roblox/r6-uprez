@@ -138,6 +138,18 @@ function RigService.detectVelocityExtrema(positions: { Vector3 }, minSeparation:
 			table.insert(maxima, i)
 		end
 	end
+	-- Classify the first and last frames by their single neighbor so the
+	-- clip's start and end can also be captured.
+	if smooth[1] <= smooth[2] then
+		table.insert(minima, 1, 1)
+	else
+		table.insert(maxima, 1, 1)
+	end
+	if smooth[F] <= smooth[F - 1] then
+		table.insert(minima, F)
+	else
+		table.insert(maxima, F)
+	end
 
 	-- Non-max suppression: minima slowest-first, maxima fastest-first
 	local function nms(candidates: { number }, slowestFirst: boolean): { number }

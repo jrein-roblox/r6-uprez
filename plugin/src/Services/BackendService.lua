@@ -27,6 +27,7 @@ function BackendService.generate(request: {
 	constraints: { { effector: string, time: number, position: { number } } }?,
 	duration: number,
 	looped: boolean?,
+	loop_offset: number?,
 	seed: number?,
 	cfg_weight: number?,
 	diffusion_steps: number?,

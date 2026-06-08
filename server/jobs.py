@@ -46,6 +46,7 @@ class JobManager:
         return job
 
     def _run(self, job: Job, fn: Callable[[Job], Any]) -> None:
+        import traceback
         job.status = JobStatus.RUNNING
         try:
             result = fn(job)
@@ -53,7 +54,9 @@ class JobManager:
             job.status = JobStatus.COMPLETED
             job.progress = 1.0
         except Exception as e:
-            job.error = str(e)
+            tb = traceback.format_exc()
+            print(f"[jobs] Job {job.id} FAILED:\n{tb}", flush=True)  # full trace to server console
+            job.error = f"{type(e).__name__}: {e}"
             job.status = JobStatus.FAILED
 
     def get(self, job_id: str) -> Optional[Job]:

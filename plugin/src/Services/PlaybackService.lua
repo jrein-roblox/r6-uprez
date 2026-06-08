@@ -205,7 +205,9 @@ function PlaybackService:seekTo(time: number)
 	if len > 0 then
 		self._duration = len
 	end
-	self._track.TimePosition = math.clamp(time, 0, self._duration)
+	-- Stay just below Length: TimePosition == Length wraps a looping track to 0.
+	local maxPos = math.max(0, self._duration - 1e-3)
+	self._track.TimePosition = math.clamp(time, 0, maxPos)
 	self._rig.animator:StepAnimations(0)
 	self.TimeChanged:Fire(time)
 end

@@ -40,6 +40,7 @@ class GenerateRequest(BaseModel):
     constraints: List[Constraint] = []
     duration: float = 3.0
     looped: bool = False
+    loop_offset: float = 0.0  # seconds into pass 1 to use as the loop pivot pose
     seed: Optional[int] = None
     cfg_weight: float = 5.0
     diffusion_steps: int = 100
@@ -216,78 +217,77 @@ def generate(req: GenerateRequest):
         job.message = "Running Kimodo generation..."
         job.progress = 0.1
 
-        if req.constraints:
-            # Build constraints and generate with them
-            kimodo_constraints = build_kimodo_constraints(req.constraints, total_duration)
+        r15_json_path = clip_dir / "r15.json"
 
-            if kimodo_constraints:
-                (clip_dir / "constraints.json").write_text(
-                    json.dumps(kimodo_constraints, indent=2)
-                )
+        kimodo_constraints = build_kimodo_constraints(req.constraints, total_duration) if req.constraints else []
+
+        # ── Stage A: produce generated.bvh ──
+        # Call the kimodo helpers directly (NOT prompt_pipeline.main, which
+        # also runs the rbxm build over the whole work/ folder — the plugin
+        # builds the CurveAnimation itself from r15.json).
+        def _run_pass(out_name: str, constraints, cfg_constraint_w: float):
+            """One kimodo pass. With constraints → separated CFG; else prompt-only."""
+            if constraints:
+                (clip_dir / "constraints.json").write_text(json.dumps(constraints, indent=2))
                 (clip_dir / "meta.json").write_text(json.dumps({
-                    "source": "romotion_plugin",
-                    "prompt": prompt_text,
-                    "duration_s": total_duration,
+                    "source": "romotion_plugin", "prompt": prompt_text,
+                    "duration": duration_str, "duration_s": total_duration,
                     "kimodo_seed": seed,
                 }, indent=2))
-
                 run_kimodo.run_kimodo(
-                    clip_dir,
-                    prompt=prompt_text,
-                    model=run_kimodo.DEFAULT_MODEL,
-                    seed=seed,
-                    diffusion_steps=req.diffusion_steps,
-                    out_name="generated",
+                    clip_dir, prompt=prompt_text, model=run_kimodo.DEFAULT_MODEL,
+                    seed=seed, diffusion_steps=req.diffusion_steps, out_name=out_name,
                     extra_args=[
                         "--cfg_type", "separated",
-                        "--cfg_weight", "2.0", "2.0",
+                        "--cfg_weight", str(req.cfg_weight), str(cfg_constraint_w),
                         "--num_transition_frames", "5",
                     ],
                     duration_override=duration_str,
                 )
             else:
-                # No valid constraints built, fall back to prompt-only
                 prompt_pipeline._run_kimodo_promptonly(
                     clip_dir, prompt=prompt_text, duration=duration_str,
                     model=run_kimodo.DEFAULT_MODEL, seed=seed,
                     diffusion_steps=req.diffusion_steps,
                     cfg_type="regular", cfg_weight=[req.cfg_weight],
-                    num_transition_frames=5, out_name="generated",
+                    num_transition_frames=5, out_name=out_name,
                 )
-        else:
-            # No constraints — prompt-only generation
-            prompt_pipeline._run_kimodo_promptonly(
-                clip_dir, prompt=prompt_text, duration=duration_str,
-                model=run_kimodo.DEFAULT_MODEL, seed=seed,
-                diffusion_steps=req.diffusion_steps,
-                cfg_type="regular", cfg_weight=[req.cfg_weight],
-                num_transition_frames=5, out_name="generated",
-            )
 
-        # Retarget BVH → R15
+        if req.looped:
+            # Two-pass loop synthesis. Pass 1 (with any user constraints) gives
+            # a pose to pin; pass 2 pins frame-0 pose at both endpoints AND keeps
+            # the user constraints so looping + constraints work together.
+            job.message = "Loop pass 1/2..."
+            _run_pass("generated_pass1", kimodo_constraints, 2.0)
+
+            n_loop = int(round(total_duration * 30))
+            sample_frame = max(0, min(int(round(req.loop_offset * 30)), n_loop - 1))
+            loop_constraints = prompt_pipeline._build_loop_constraints(
+                clip_dir / "generated_pass1.npz", n_frames=n_loop, sample_frame=sample_frame,
+            )
+            merged = loop_constraints + kimodo_constraints  # pins + user constraints
+
+            job.message = "Loop pass 2/2..."
+            job.progress = 0.4
+            _run_pass("generated", merged, 4.0)
+        else:
+            _run_pass("generated", kimodo_constraints, 2.0)
+
+        # ── Stage B: retarget generated.bvh → r15.json + ground ──
         job.message = "Retargeting to R15..."
         job.progress = 0.7
-
         bvh_path = clip_dir / "generated.bvh"
-        r15_json_path = clip_dir / "r15.json"
-
         export_r15.set_rig(parent_pipeline.RIG if req.target_rig == "r15" else "r15plus")
         soma_bind = prompt_pipeline._soma_bind_hip_to_ankle_studs()
         hrp_to_ankle = prompt_pipeline._RTHRO_HRP_TO_ANKLE
-        hrp_scale = hrp_to_ankle / soma_bind
-
         parent_pipeline._retarget_bvh_to_r15_json(
             bvh_path, r15_json_path,
-            root_motion=False,
-            source_n_frames=0,
-            loop_passes=1,
+            root_motion=False, source_n_frames=0, loop_passes=1,
             looped=req.looped,
             inertial_blend_frames=6 if req.looped else 0,
-            hrp_scale=hrp_scale,
+            hrp_scale=hrp_to_ankle / soma_bind,
             target_rig=req.target_rig,
         )
-
-        # Ground correction
         result = json.loads(r15_json_path.read_text())
         offset = prompt_pipeline._ground_y(
             result, bvh_path, "first",
