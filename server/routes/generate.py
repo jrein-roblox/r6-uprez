@@ -225,33 +225,32 @@ def generate(req: GenerateRequest):
         # Call the kimodo helpers directly (NOT prompt_pipeline.main, which
         # also runs the rbxm build over the whole work/ folder — the plugin
         # builds the CurveAnimation itself from r15.json).
+        import kimodo_warm
+
         def _run_pass(out_name: str, constraints, cfg_constraint_w: float):
-            """One kimodo pass. With constraints → separated CFG; else prompt-only."""
+            """One kimodo pass (warm, in-process). With constraints → separated CFG."""
+            constraints_path = None
             if constraints:
-                (clip_dir / "constraints.json").write_text(json.dumps(constraints, indent=2))
-                (clip_dir / "meta.json").write_text(json.dumps({
-                    "source": "romotion_plugin", "prompt": prompt_text,
-                    "duration": duration_str, "duration_s": total_duration,
-                    "kimodo_seed": seed,
-                }, indent=2))
-                run_kimodo.run_kimodo(
-                    clip_dir, prompt=prompt_text, model=run_kimodo.DEFAULT_MODEL,
-                    seed=seed, diffusion_steps=req.diffusion_steps, out_name=out_name,
-                    extra_args=[
-                        "--cfg_type", "separated",
-                        "--cfg_weight", str(req.cfg_weight), str(cfg_constraint_w),
-                        "--num_transition_frames", "5",
-                    ],
-                    duration_override=duration_str,
-                )
+                constraints_path = clip_dir / "constraints.json"
+                constraints_path.write_text(json.dumps(constraints, indent=2))
+                cfg_type = "separated"
+                cfg_weight = [req.cfg_weight, cfg_constraint_w]
             else:
-                prompt_pipeline._run_kimodo_promptonly(
-                    clip_dir, prompt=prompt_text, duration=duration_str,
-                    model=run_kimodo.DEFAULT_MODEL, seed=seed,
-                    diffusion_steps=req.diffusion_steps,
-                    cfg_type="regular", cfg_weight=[req.cfg_weight],
-                    num_transition_frames=5, out_name=out_name,
-                )
+                cfg_type = "regular"
+                cfg_weight = [req.cfg_weight]
+
+            kimodo_warm.generate_bvh(
+                clip_dir,
+                prompt=prompt_text,
+                duration_str=duration_str,
+                seed=seed,
+                diffusion_steps=req.diffusion_steps,
+                cfg_type=cfg_type,
+                cfg_weight=cfg_weight,
+                num_transition_frames=5,
+                out_name=out_name,
+                constraints_path=constraints_path,
+            )
 
         if req.looped:
             # Two-pass loop synthesis. Pass 1 (with any user constraints) gives
