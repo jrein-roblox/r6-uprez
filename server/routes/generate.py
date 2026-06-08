@@ -69,6 +69,7 @@ EFF_MAP = {
     "RightFoot": ("right-foot", "RightFoot"),
     "LeftHand": ("left-hand", "LeftHand"),
     "RightHand": ("right-hand", "RightHand"),
+    "Hips": ("end-effector", "Hips"),  # Hips = SOMA root (joint 0)
 }
 
 # Position scale:
@@ -94,7 +95,9 @@ def build_kimodo_constraints(constraints: List[Constraint], total_duration: floa
 
     SOMA30_N_JOINTS = 30
     fps = 30
-    n_frames = int(round(total_duration * fps)) + 1
+    # Kimodo produces round(duration*fps) frames, indices 0..n_frames-1.
+    # (No +1: a 3s clip = 90 frames, last valid index is 89.)
+    n_frames = int(round(total_duration * fps))
 
     kimodo_constraints = []
     for c in constraints:
@@ -125,8 +128,32 @@ def build_kimodo_constraints(constraints: List[Constraint], total_duration: floa
             ])
             chain_quat_kimodo[snake] = np.array([qw, -qx, qy, -qz])  # wxyz
 
+        # Hips → root2d constraint (XZ position + heading). This is the
+        # canonical Kimodo way to constrain the root, and loads in the viewer.
+        if c.effector == "Hips":
+            lt = chain_pos_kimodo.get("lower_torso")
+            if lt is None:
+                continue
+            smooth_2d = [[float(lt[0]), float(lt[2])]]
+            entry = {
+                "type": "root2d",
+                "frame_indices": [frame_idx],
+                "smooth_root_2d": smooth_2d,
+            }
+            # Heading from hips Y rotation (cos, sin of yaw)
+            ltq = chain_quat_kimodo.get("lower_torso")
+            if ltq is not None:
+                w, x, y, z = ltq  # wxyz
+                # yaw from quaternion (rotation about Y)
+                yaw = np.arctan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + x * x))
+                entry["global_root_heading"] = [[float(np.cos(yaw)), float(np.sin(yaw))]]
+            print(f"[generate] Hips root2d at frame {frame_idx}: xz={smooth_2d}")
+            kimodo_constraints.append(entry)
+            continue
+
         # Retarget chain rotations to SOMA30 using pipeline's proven function
         local_rots = np.zeros((1, SOMA30_N_JOINTS, 3))
+
         R15_CHAINS = getattr(r2k, 'R15_CHAINS', None)
         if R15_CHAINS and ctype in R15_CHAINS:
             chain_def = R15_CHAINS[ctype]

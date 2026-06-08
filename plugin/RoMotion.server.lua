@@ -74,6 +74,66 @@ local appState = {
 
 local playbackSvc: typeof(PlaybackService.new(nil :: any))? = nil
 
+-- Constraint color: base effector hue shifted subtly by timeline position
+-- so multiple constraints of the same effector are visually distinguishable.
+local function constraintColor(effector: string, timeFrac: number): Color3
+	local base = Constants.EFFECTOR_COLORS[effector] or Color3.new(1, 1, 1)
+	local h, s, v = base:ToHSV()
+	h = (h + (timeFrac - 0.5) * 0.16) % 1 -- ±0.08 hue shift across the timeline
+	return Color3.fromHSV(h, s, v)
+end
+
+-- Authoritative max timeline time: longer of the prompt timeline and the
+-- loaded animation track. Used by scrub + all constraint/prompt drag clamps.
+local function getMaxTime(): number
+	local prompts = appState.prompts:get()
+	local promptEnd = if #prompts > 0 then prompts[#prompts].endTime else 0
+	local trackEnd = if playbackSvc then playbackSvc:getDuration() else 0
+	return math.max(promptEnd, trackEnd, 1)
+end
+
+-- Time of the LAST valid frame. A clip of duration D has frames 0..N-1 where
+-- N = round(D*fps); the last frame sits at (N-1)/fps, NOT D. Scrubbing or
+-- constraining to D would land on frame N (one past the end) which Kimodo drops
+-- and which wraps the AnimationTrack to the start.
+local function getLastFrameTime(): number
+	local n = math.max(1, math.floor(getMaxTime() * Constants.FPS + 0.5))
+	return (n - 1) / Constants.FPS
+end
+
+-- Place a constraint for `effector` at `time`, capturing the rig's current
+-- pose. Seeks playback to `time` first so the chain is captured at that frame.
+-- Shared by manual placement (label click) and auto-constraint.
+local function placeConstraint(effector: string, time: number)
+	local rig = appState.rig:get()
+	if not rig then return end
+
+	-- Snap to nearest frame at FPS
+	time = math.floor(time * Constants.FPS + 0.5) / Constants.FPS
+
+	if playbackSvc then
+		playbackSvc:seekTo(time)
+		playbackSvc:ensureStepped()
+	end
+
+	local effPart = RigService.getEffectorPart(rig, effector)
+	if not effPart then return end
+
+	local color = Constants.EFFECTOR_COLORS[effector] or Color3.new(1, 1, 1)
+	local chainModel = RigService.cloneChain(rig, effector, color)
+	if not chainModel then return end
+
+	local constraints_val = table.clone(appState.constraints:get())
+	table.insert(constraints_val, {
+		effector = effector,
+		time = time,
+		cframe = effPart.CFrame,
+		chain = chainModel,
+	})
+	table.sort(constraints_val, function(a, b) return a.time < b.time end)
+	appState.constraints:set(constraints_val)
+end
+
 -- ════════════════════════════════════════════════════════════════════
 -- UI Construction
 -- ════════════════════════════════════════════════════════════════════
@@ -84,6 +144,22 @@ local function createThemeColor(element: string): Color3
 end
 
 local function buildUI()
+	local GUTTER = Constants.GUTTER
+
+	-- Timeline coordinate conversion (shared everywhere). time=0 maps to x=GUTTER
+	-- so the left gutter holds effector labels/+buttons without overlapping content.
+	local function timeToPx(t: number): number
+		return GUTTER + (t - appState.scrollOffset:get()) * appState.pixelsPerSecond:get()
+	end
+	-- relX is relative to a frame whose left edge is the timeline left edge.
+	local function pxToTime(relX: number): number
+		return (relX - GUTTER) / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
+	end
+	-- Snap a time to the nearest frame at FPS.
+	local function snapToFrame(t: number): number
+		return math.floor(t * Constants.FPS + 0.5) / Constants.FPS
+	end
+
 	-- Main container
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "MainFrame"
@@ -110,6 +186,7 @@ local function buildUI()
 	local topLayout = Instance.new("UIListLayout")
 	topLayout.FillDirection = Enum.FillDirection.Horizontal
 	topLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+	topLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	topLayout.Padding = UDim.new(0, 8)
 	topLayout.Parent = topBar
 
@@ -126,6 +203,7 @@ local function buildUI()
 	rigLabel.TextSize = 13
 	rigLabel.Font = Enum.Font.SourceSans
 	rigLabel.TextXAlignment = Enum.TextXAlignment.Left
+	rigLabel.LayoutOrder = 1
 	rigLabel.Parent = topBar
 
 	-- Duration input
@@ -137,6 +215,7 @@ local function buildUI()
 	durLabel.TextSize = 12
 	durLabel.Font = Enum.Font.SourceSans
 	durLabel.TextXAlignment = Enum.TextXAlignment.Right
+	durLabel.LayoutOrder = 2
 	durLabel.Parent = topBar
 
 	local durInput = Instance.new("TextBox")
@@ -149,6 +228,7 @@ local function buildUI()
 	durInput.TextSize = 12
 	durInput.Font = Enum.Font.Code
 	durInput.ClearTextOnFocus = false
+	durInput.LayoutOrder = 3
 	durInput.Parent = topBar
 	local durCorner = Instance.new("UICorner")
 	durCorner.CornerRadius = UDim.new(0, 3)
@@ -161,6 +241,7 @@ local function buildUI()
 	durSuffix.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
 	durSuffix.TextSize = 12
 	durSuffix.Font = Enum.Font.SourceSans
+	durSuffix.LayoutOrder = 4
 	durSuffix.Parent = topBar
 
 	durInput.FocusLost:Connect(function()
@@ -184,10 +265,53 @@ local function buildUI()
 		durInput.Text = string.format("%.1f", d)
 	end)
 
+	-- Seed input (0 = random each generation)
+	local seedLabel = Instance.new("TextLabel")
+	seedLabel.Size = UDim2.new(0, 36, 1, 0)
+	seedLabel.BackgroundTransparency = 1
+	seedLabel.Text = "Seed:"
+	seedLabel.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.DimmedText)
+	seedLabel.TextSize = 12
+	seedLabel.Font = Enum.Font.SourceSans
+	seedLabel.TextXAlignment = Enum.TextXAlignment.Right
+	seedLabel.LayoutOrder = 5
+	seedLabel.Parent = topBar
+
+	local seedInput = Instance.new("TextBox")
+	seedInput.Name = "SeedInput"
+	seedInput.Size = UDim2.new(0, 70, 0, 20)
+	seedInput.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+	seedInput.BorderColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Border)
+	seedInput.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+	seedInput.Text = "0"
+	seedInput.PlaceholderText = "0 = random"
+	seedInput.TextSize = 12
+	seedInput.Font = Enum.Font.Code
+	seedInput.ClearTextOnFocus = false
+	seedInput.LayoutOrder = 6
+	seedInput.Parent = topBar
+	local seedCorner = Instance.new("UICorner")
+	seedCorner.CornerRadius = UDim.new(0, 3)
+	seedCorner.Parent = seedInput
+
+	seedInput.FocusLost:Connect(function()
+		local val = tonumber(seedInput.Text)
+		if val and val >= 0 then
+			appState.seed:set(math.floor(val))
+		else
+			seedInput.Text = tostring(appState.seed:get())
+		end
+	end)
+
+	appState.seed:subscribe(function(s)
+		seedInput.Text = tostring(s)
+	end)
+
 	local serverDot = Instance.new("Frame")
 	serverDot.Name = "ServerDot"
 	serverDot.Size = UDim2.new(0, 8, 0, 8)
 	serverDot.BackgroundColor3 = Color3.fromRGB(244, 67, 54)
+	serverDot.LayoutOrder = 7
 	serverDot.Parent = topBar
 	local corner = Instance.new("UICorner")
 	corner.CornerRadius = UDim.new(1, 0)
@@ -202,6 +326,7 @@ local function buildUI()
 	serverLabel.TextSize = 11
 	serverLabel.Font = Enum.Font.SourceSans
 	serverLabel.TextXAlignment = Enum.TextXAlignment.Left
+	serverLabel.LayoutOrder = 8
 	serverLabel.Parent = topBar
 
 	-- ─── Toolbar (Transport + Generate + Actions) ───
@@ -294,6 +419,9 @@ local function buildUI()
 	local autoConstrainBtn = makeButton("AutoConstrain", "Auto-C")
 	autoConstrainBtn.Size = UDim2.new(0, 56, 0, 26)
 
+	local clearBtn = makeButton("ClearConstraints", "Clear")
+	clearBtn.Size = UDim2.new(0, 48, 0, 26)
+
 	local importBtn = makeButton("Import", "Import")
 	importBtn.Size = UDim2.new(0, 56, 0, 26)
 
@@ -343,6 +471,7 @@ local function buildUI()
 	-- Forward declarations for constraint drag system
 	local constraintDiamonds: { Frame } = {}
 	local draggingConstraint: number? = nil
+	local selectedConstraint: number? = nil
 	local renderConstraints: () -> ()
 
 	for i, effName in Constants.EFFECTORS do
@@ -358,8 +487,32 @@ local function buildUI()
 		track.Active = true
 		track.Parent = constraintArea
 
+		local eName = effName
+
+		-- "+" button to add a constraint for this effector at the current time
+		local addBtn = Instance.new("TextButton")
+		addBtn.Name = "Add"
+		addBtn.Size = UDim2.new(0, 18, 0, 18)
+		addBtn.Position = UDim2.new(0, 2, 0.5, -9)
+		addBtn.BackgroundColor3 = Constants.EFFECTOR_COLORS[effName] or Color3.new(1, 1, 1)
+		addBtn.BackgroundTransparency = 0.3
+		addBtn.Text = "+"
+		addBtn.TextColor3 = Color3.new(0, 0, 0)
+		addBtn.TextSize = 14
+		addBtn.Font = Enum.Font.SourceSansBold
+		addBtn.AutoButtonColor = true
+		addBtn.ZIndex = 6
+		addBtn.Parent = track
+		local addCorner = Instance.new("UICorner")
+		addCorner.CornerRadius = UDim.new(0, 3)
+		addCorner.Parent = addBtn
+		addBtn.MouseButton1Click:Connect(function()
+			placeConstraint(eName, appState.playbackTime:get())
+		end)
+
 		local label = Instance.new("TextLabel")
-		label.Size = UDim2.new(0, 70, 1, 0)
+		label.Size = UDim2.new(0, 60, 1, 0)
+		label.Position = UDim2.new(0, 24, 0, 0)
 		label.BackgroundTransparency = 1
 		label.Text = effName
 		label.TextColor3 = Constants.EFFECTOR_COLORS[effName] or Color3.new(1, 1, 1)
@@ -368,59 +521,15 @@ local function buildUI()
 		label.TextXAlignment = Enum.TextXAlignment.Left
 		label.Parent = track
 
-		local pad = Instance.new("UIPadding")
-		pad.PaddingLeft = UDim.new(0, 4)
-		pad.Parent = label
-
-		-- Click to place a constraint at the current playback time.
-		-- Clones the full effector chain as a poseable ghost.
-		-- Label click to add constraint (not the whole track)
-		local eName = effName
-		label.InputBegan:Connect(function(input)
-			if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-			local rig = appState.rig:get()
-			if not rig then return end
-
-			-- Ensure animation is stepped at current time so transforms are populated
-			if playbackSvc then
-				playbackSvc:ensureStepped()
-			end
-
-			local time = appState.playbackTime:get()
-			local effPart = RigService.getEffectorPart(rig, eName)
-			if not effPart then return end
-
-			local color = Constants.EFFECTOR_COLORS[eName] or Color3.new(1, 1, 1)
-			local chainModel = RigService.cloneChain(rig, eName, color)
-			if not chainModel then return end
-
-			local constraints_val = table.clone(appState.constraints:get())
-			table.insert(constraints_val, {
-				effector = eName,
-				time = time,
-				cframe = effPart.CFrame,
-				chain = chainModel, -- ChainData from RigService.cloneChain
-			})
-			table.sort(constraints_val, function(a, b) return a.time < b.time end)
-			appState.constraints:set(constraints_val)
-		end)
-
 		-- Drag movement on this track
 		track.InputChanged:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseMovement and draggingConstraint then
 				local relX = input.Position.X - constraintArea.AbsolutePosition.X
-				local newTime = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-				local maxT = appState.duration:get()
-				if maxT <= 0 and playbackSvc then maxT = playbackSvc:getDuration() end
-				if maxT <= 0 then maxT = 10 end
-				newTime = math.clamp(newTime, 0, maxT)
+				local newTime = math.clamp(pxToTime(relX), 0, getLastFrameTime())
 
 				-- Move the diamond directly (don't trigger renderConstraints)
-				local pps = appState.pixelsPerSecond:get()
-				local scroll = appState.scrollOffset:get()
-				local px = (newTime - scroll) * pps
 				if constraintDiamonds[draggingConstraint] then
-					constraintDiamonds[draggingConstraint].Position = UDim2.new(0, math.floor(px) - 8, 0.5, -8)
+					constraintDiamonds[draggingConstraint].Position = UDim2.new(0, math.floor(timeToPx(newTime)) - 8, 0.5, -8)
 				end
 
 				-- Update state silently (renderConstraints skips during drag)
@@ -434,6 +543,15 @@ local function buildUI()
 		end)
 		track.InputEnded:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				-- Snap the dragged constraint to the nearest frame
+				if draggingConstraint then
+					local updated = table.clone(appState.constraints:get())
+					if draggingConstraint <= #updated then
+						updated[draggingConstraint] = table.clone(updated[draggingConstraint])
+						updated[draggingConstraint].time = snapToFrame(updated[draggingConstraint].time)
+						appState.constraints:set(updated)
+					end
+				end
 				draggingConstraint = nil
 				renderConstraints() -- rebuild now that drag is over
 			end
@@ -468,8 +586,7 @@ local function buildUI()
 
 	appState.playbackTime:subscribe(function(t)
 		timeLabel.Text = string.format("%.3fs", t)
-		local px = (t - appState.scrollOffset:get()) * appState.pixelsPerSecond:get()
-		playhead.Position = UDim2.new(0, math.floor(px), 0, 0)
+		playhead.Position = UDim2.new(0, math.floor(timeToPx(t)), 0, 0)
 	end)
 
 	appState.generationStatus:subscribe(function(status)
@@ -618,8 +735,10 @@ local function buildUI()
 						if loaded then
 							appState.generationStatus:set("completed")
 							appState.duration:set(playbackSvc:getDuration())
+							-- Show the seed that was used (don't overwrite the input,
+							-- so seed=0 keeps generating fresh random results)
 							if resultData.seed then
-								appState.seed:set(resultData.seed)
+								appState.generationMessage:set("Done (seed " .. tostring(resultData.seed) .. ")")
 							end
 						else
 							appState.generationStatus:set("failed")
@@ -643,29 +762,147 @@ local function buildUI()
 	end)
 
 	autoConstrainBtn.MouseButton1Click:Connect(function()
-		local jobId = appState.currentJobId:get()
-		if not jobId then
-			warn("[RoMotion] No generation to analyze")
+		local rig = appState.rig:get()
+		if not rig or not playbackSvc then
+			warn("[RoMotion] Select a rig and generate/import an animation first")
 			return
 		end
 
 		task.spawn(function()
-			local ok, result = pcall(function()
-				return BackendService.autoConstraints({ job_id = jobId })
-			end)
-			if ok and result then
-				local newConstraints: { DataModelService.ConstraintData } = {}
-				for _, c in result.constraints do
-					table.insert(newConstraints, {
-						effector = c.effector,
-						time = c.time,
-						cframe = CFrame.new(c.position[1], c.position[2], c.position[3]),
-					})
+			local fps = Constants.FPS
+			local duration = playbackSvc:getDuration()
+			local nFrames = math.max(3, math.floor(duration * fps))
+			local effectors = { "LeftHand", "RightHand", "LeftFoot", "RightFoot" }
+			local hrpInv = rig.rootPart.CFrame:Inverse()
+
+			appState.generationMessage:set("Analyzing motion...")
+
+			-- Sample each effector's HRP-local position at every frame
+			local samples: { [string]: { Vector3 } } = {}
+			for _, e in effectors do samples[e] = {} end
+
+			for f = 0, nFrames - 1 do
+				local t = f / fps
+				playbackSvc:seekTo(t)
+				playbackSvc:ensureStepped()
+				for _, e in effectors do
+					local part = RigService.getEffectorPart(rig, e)
+					if part then
+						-- HRP-local so locomotion doesn't dominate the velocity
+						samples[e][f + 1] = hrpInv * part.Position
+					else
+						samples[e][f + 1] = Vector3.zero
+					end
 				end
-				appState.constraints:set(newConstraints)
-			else
-				warn("[RoMotion] Auto-constraint failed:", result)
 			end
+
+			-- Detect extrema per effector, collect (effector, time) pairs
+			local picks: { { effector: string, time: number } } = {}
+			for _, e in effectors do
+				local frames = RigService.detectVelocityExtrema(samples[e], 8)
+				for _, f in frames do
+					table.insert(picks, { effector = e, time = (f - 1) / fps })
+				end
+			end
+
+			-- Place a constraint at each detected pose
+			for _, p in picks do
+				placeConstraint(p.effector, p.time)
+				task.wait()
+			end
+			appState.generationMessage:set(string.format("Auto-placed %d constraints", #picks))
+		end)
+	end)
+
+	-- Clear all constraints (and their workspace chain models)
+	clearBtn.MouseButton1Click:Connect(function()
+		for _, c in appState.constraints:get() do
+			if c.chain and type(c.chain) == "table" and c.chain.model then
+				RigService.destroyChain(c.chain)
+			end
+		end
+		appState.constraints:set({})
+	end)
+
+	-- Import: prompt for an asset ID, load it onto the rig for scrub/constrain
+	importBtn.MouseButton1Click:Connect(function()
+		local rig = appState.rig:get()
+		if not rig then
+			warn("[RoMotion] Select a rig before importing")
+			return
+		end
+
+		-- Small centered input dialog
+		local dialog = Instance.new("Frame")
+		dialog.Size = UDim2.new(0, 260, 0, 70)
+		dialog.Position = UDim2.new(0.5, -130, 0.5, -35)
+		dialog.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Titlebar)
+		dialog.BorderColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Border)
+		dialog.BorderSizePixel = 1
+		dialog.ZIndex = 200
+		dialog.Parent = mainFrame
+
+		local prompt = Instance.new("TextLabel")
+		prompt.Size = UDim2.new(1, -16, 0, 20)
+		prompt.Position = UDim2.new(0, 8, 0, 6)
+		prompt.BackgroundTransparency = 1
+		prompt.Text = "Animation Asset ID:"
+		prompt.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+		prompt.TextSize = 12
+		prompt.Font = Enum.Font.SourceSans
+		prompt.TextXAlignment = Enum.TextXAlignment.Left
+		prompt.ZIndex = 201
+		prompt.Parent = dialog
+
+		local input = Instance.new("TextBox")
+		input.Size = UDim2.new(1, -16, 0, 24)
+		input.Position = UDim2.new(0, 8, 0, 30)
+		input.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground)
+		input.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.MainText)
+		input.PlaceholderText = "e.g. 507771019"
+		input.Text = ""
+		input.TextSize = 13
+		input.Font = Enum.Font.Code
+		input.ClearTextOnFocus = false
+		input.ZIndex = 201
+		input.Parent = dialog
+		input:CaptureFocus()
+
+		input.FocusLost:Connect(function(enterPressed)
+			if enterPressed then
+				local id = tonumber(input.Text)
+				if id and id > 0 then
+					task.spawn(function()
+						appState.generationMessage:set("Loading asset " .. id .. "...")
+						if playbackSvc then
+							local loaded = playbackSvc:loadFromAssetId(id)
+							if loaded then
+								local dur = playbackSvc:getDuration()
+								appState.duration:set(dur)
+								-- Resize the prompt timeline to match the imported clip
+								local prompts_val = appState.prompts:get()
+								if #prompts_val == 0 then
+									appState.prompts:set({
+										{ text = "imported motion", startTime = 0, endTime = dur },
+									})
+								else
+									-- Stretch last block so the timeline ends at `dur`
+									local updated = table.clone(prompts_val)
+									updated[#updated] = table.clone(updated[#updated])
+									updated[#updated].endTime = math.max(
+										dur, updated[#updated].startTime + 0.3
+									)
+									appState.prompts:set(updated)
+								end
+								appState.generationMessage:set("Imported " .. id .. string.format(" (%.1fs)", dur))
+							else
+								appState.generationMessage:set("Import failed")
+							end
+						end
+					end)
+				end
+			end
+			dialog:Destroy()
 		end)
 	end)
 
@@ -674,12 +911,7 @@ local function buildUI()
 
 	local function scrubToInput(input: InputObject)
 		local relX = input.Position.X - timelineFrame.AbsolutePosition.X
-		local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-		local prompts_val = appState.prompts:get()
-		local promptEnd = if #prompts_val > 0 then prompts_val[#prompts_val].endTime else 0
-		local trackEnd = if playbackSvc then playbackSvc:getDuration() else 0
-		local maxTime = math.max(promptEnd, trackEnd, 1)
-		time = math.clamp(time, 0, maxTime)
+		local time = math.clamp(pxToTime(relX), 0, getLastFrameTime())
 		appState.playbackTime:set(time)
 		if playbackSvc then
 			playbackSvc:seekTo(time)
@@ -688,46 +920,16 @@ local function buildUI()
 
 	-- Drag handling
 	local function endDrag()
-		draggingPromptIdx = nil
-		draggingPromptEdge = nil
 		draggingConstraint = nil
 		isScrubbing = false
 	end
 
-	-- Movement handler shared by all drag-sensitive areas
+	-- Movement handler: scrubbing only. Constraint/prompt drags are owned by
+	-- their per-track InputChanged handlers (correct gutter math).
 	local function onDragMove(input: InputObject)
 		if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-
 		if isScrubbing then
 			scrubToInput(input)
-		end
-
-		if draggingPromptIdx then
-			local relX = input.Position.X - promptTrack.AbsolutePosition.X
-			local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-			time = math.clamp(time, 0, appState.duration:get())
-			local updated = table.clone(appState.prompts:get())
-			if draggingPromptIdx <= #updated then
-				updated[draggingPromptIdx] = table.clone(updated[draggingPromptIdx])
-				if draggingPromptEdge == "right" then
-					updated[draggingPromptIdx].endTime = math.max(time, updated[draggingPromptIdx].startTime + 0.2)
-				elseif draggingPromptEdge == "left" then
-					updated[draggingPromptIdx].startTime = math.min(time, updated[draggingPromptIdx].endTime - 0.2)
-				end
-				appState.prompts:set(updated)
-			end
-		end
-
-		if draggingConstraint then
-			local relX = input.Position.X - constraintArea.AbsolutePosition.X
-			local newTime = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-			newTime = math.clamp(newTime, 0, appState.duration:get())
-			local updated = table.clone(appState.constraints:get())
-			if draggingConstraint <= #updated then
-				updated[draggingConstraint] = table.clone(updated[draggingConstraint])
-				updated[draggingConstraint].time = newTime
-				appState.constraints:set(updated)
-			end
 		end
 	end
 
@@ -836,7 +1038,7 @@ local function buildUI()
 		local x = 0
 		for i, prompt in prompts_val do
 			local dur = prompt.endTime - prompt.startTime
-			local startPx = (x - scroll) * pps
+			local startPx = timeToPx(x)
 			local w = dur * pps
 
 			local block = Instance.new("Frame")
@@ -911,7 +1113,7 @@ local function buildUI()
 			local boundary = Instance.new("Frame")
 			boundary.Name = "Boundary_" .. tostring(i)
 			boundary.Size = UDim2.new(0, 8, 1, 0)
-			boundary.Position = UDim2.new(0, math.floor((x - scroll) * pps) - 4, 0, 0)
+			boundary.Position = UDim2.new(0, math.floor(timeToPx(x)) - 4, 0, 0)
 			boundary.BackgroundColor3 = if isLast then Color3.fromRGB(255, 120, 120) else Color3.new(1, 1, 1)
 			boundary.BackgroundTransparency = 0.5
 			boundary.BorderSizePixel = 0
@@ -938,8 +1140,7 @@ local function buildUI()
 
 		local relX = input.Position.X - promptTrack.AbsolutePosition.X
 		local pps = appState.pixelsPerSecond:get()
-		local scroll = appState.scrollOffset:get()
-		local time = relX / pps + scroll
+		local time = pxToTime(relX)
 
 		local prompts_val = appState.prompts:get()
 		local isLast = (draggingBoundary == #prompts_val)
@@ -948,14 +1149,13 @@ local function buildUI()
 			-- Drag last edge: extend/shrink last block
 			local beforeStart = prompts_val[#prompts_val].startTime
 			local newDur = math.max(0.3, time - beforeStart)
-			-- Update visual directly
 			local lastBlock = promptElements[#prompts_val]
 			local lastBoundary = promptElements[#promptElements]
 			if lastBlock and lastBlock:IsA("Frame") then
 				lastBlock.Size = UDim2.new(0, math.floor(newDur * pps), 1, -4)
 			end
 			if lastBoundary and lastBoundary:IsA("Frame") then
-				lastBoundary.Position = UDim2.new(0, math.floor((beforeStart + newDur - scroll) * pps) - 4, 0, 0)
+				lastBoundary.Position = UDim2.new(0, math.floor(timeToPx(beforeStart + newDur)) - 4, 0, 0)
 			end
 		else
 			-- Internal boundary: resize blocks[idx] and blocks[idx+1]
@@ -966,7 +1166,6 @@ local function buildUI()
 			local newDur1 = time - beforeStart
 			local newDur2 = afterEnd - time
 
-			-- Update visuals directly
 			local block1 = promptElements[draggingBoundary]
 			local block2 = promptElements[draggingBoundary + 1]
 			local boundary = promptElements[#appState.prompts:get() + draggingBoundary]
@@ -974,11 +1173,11 @@ local function buildUI()
 				block1.Size = UDim2.new(0, math.floor(newDur1 * pps), 1, -4)
 			end
 			if block2 and block2:IsA("Frame") then
-				block2.Position = UDim2.new(0, math.floor((time - scroll) * pps), 0, 2)
+				block2.Position = UDim2.new(0, math.floor(timeToPx(time)), 0, 2)
 				block2.Size = UDim2.new(0, math.floor(newDur2 * pps), 1, -4)
 			end
 			if boundary and boundary:IsA("Frame") then
-				boundary.Position = UDim2.new(0, math.floor((time - scroll) * pps) - 4, 0, 0)
+				boundary.Position = UDim2.new(0, math.floor(timeToPx(time)) - 4, 0, 0)
 			end
 		end
 	end)
@@ -987,9 +1186,7 @@ local function buildUI()
 	promptTrack.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 and draggingBoundary then
 			local relX = input.Position.X - promptTrack.AbsolutePosition.X
-			local pps = appState.pixelsPerSecond:get()
-			local scroll = appState.scrollOffset:get()
-			local time = relX / pps + scroll
+			local time = snapToFrame(pxToTime(relX))
 
 			local prompts_val = appState.prompts:get()
 			local updated = table.clone(prompts_val)
@@ -1051,9 +1248,7 @@ local function buildUI()
 		origRender()
 		local prompts_val = appState.prompts:get()
 		local totalDur = if #prompts_val > 0 then prompts_val[#prompts_val].endTime else 0
-		local pps = appState.pixelsPerSecond:get()
-		local scroll = appState.scrollOffset:get()
-		addBlockBtn.Position = UDim2.new(0, math.floor((totalDur - scroll) * pps) + 8, 0.5, -12)
+		addBlockBtn.Position = UDim2.new(0, math.floor(timeToPx(totalDur)) + 8, 0.5, -12)
 	end
 
 	appState.prompts:subscribe(renderPromptBlocks)
@@ -1071,31 +1266,69 @@ local function buildUI()
 		local constraints_val = appState.constraints:get()
 		local pps = appState.pixelsPerSecond:get()
 		local scroll = appState.scrollOffset:get()
+		local maxT = getMaxTime()
+
+		-- Per-effector ordinal (1st, 2nd, ... of each effector by time order)
+		local effCount: { [string]: number } = {}
 
 		for i, constraint in constraints_val do
 			local effTrack = constraintArea:FindFirstChild(constraint.effector)
 			if not effTrack then continue end
 
-			local px = (constraint.time - scroll) * pps
+			effCount[constraint.effector] = (effCount[constraint.effector] or 0) + 1
+			local ordinal = effCount[constraint.effector]
+			local timeFrac = math.clamp(constraint.time / maxT, 0, 1)
+			local color = constraintColor(constraint.effector, timeFrac)
+
+			local px = timeToPx(constraint.time)
 			local diamond = Instance.new("Frame")
 			diamond.Name = "C_" .. constraint.effector .. "_" .. tostring(i)
 			diamond.Size = UDim2.new(0, 16, 0, 16)
 			diamond.Position = UDim2.new(0, math.floor(px) - 8, 0.5, -8)
-			diamond.BackgroundColor3 = Constants.EFFECTOR_COLORS[constraint.effector] or Color3.new(1, 1, 1)
+			diamond.BackgroundColor3 = color
 			diamond.Rotation = 0
 			diamond.Active = true
 			diamond.ZIndex = 5
+			diamond.BorderSizePixel = if i == selectedConstraint then 2 else 0
+			diamond.BorderColor3 = Color3.new(1, 1, 1)
 			diamond.Parent = effTrack
 			local diamondCorner = Instance.new("UICorner")
 			diamondCorner.CornerRadius = UDim.new(0, 3)
 			diamondCorner.Parent = diamond
 
+			-- Number label on the diamond
+			local numLbl = Instance.new("TextLabel")
+			numLbl.Size = UDim2.fromScale(1, 1)
+			numLbl.BackgroundTransparency = 1
+			numLbl.Text = tostring(ordinal)
+			numLbl.TextColor3 = Color3.new(0, 0, 0)
+			numLbl.TextSize = 11
+			numLbl.Font = Enum.Font.SourceSansBold
+			numLbl.ZIndex = 6
+			numLbl.Parent = diamond
+
+			-- Update the matching world chain marker (number + hue)
+			if constraint.chain and type(constraint.chain) == "table" and constraint.chain.parts then
+				RigService.labelChain(constraint.chain, constraint.effector, ordinal, color)
+			end
+
 			local idx = i
 
-			-- Left-click to start drag (parent track handles move+release)
+			-- Left-click: select (UI + DataModel) and start drag
 			diamond.InputBegan:Connect(function(input)
 				if input.UserInputType == Enum.UserInputType.MouseButton1 then
 					draggingConstraint = idx
+					selectedConstraint = idx
+					-- Select the chain model in the explorer/viewport
+					local c = appState.constraints:get()[idx]
+					if c and c.chain and type(c.chain) == "table" and c.chain.model then
+						Selection:Set({ c.chain.model })
+					end
+					-- Re-highlight without full rebuild (we're mid-drag)
+					for di, d in constraintDiamonds do
+						d.BorderSizePixel = if di == idx then 2 else 0
+						d.BorderColor3 = Color3.new(1, 1, 1)
+					end
 				end
 			end)
 
@@ -1143,8 +1376,8 @@ local function buildUI()
 
 		local time = startTime
 		while time <= endTime do
-			local px = (time - scroll) * pps
-			if px >= 0 then
+			local px = timeToPx(time)
+			if px >= GUTTER then
 				local tick = Instance.new("TextLabel")
 				tick.Size = UDim2.new(0, 40, 1, 0)
 				tick.Position = UDim2.new(0, math.floor(px), 0, 0)
@@ -1165,45 +1398,10 @@ local function buildUI()
 	appState.scrollOffset:subscribe(renderRuler)
 	task.defer(renderRuler)
 
-	-- Double-click prompt track to add a prompt
-	promptTrack.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			-- Check if double-click (simplified: just add on click for now)
-			local relX = input.Position.X - promptTrack.AbsolutePosition.X
-			local time = relX / appState.pixelsPerSecond:get() + appState.scrollOffset:get()
-			time = math.max(0, time)
-
-			-- Find gap at this time
-			local prompts_val = appState.prompts:get()
-			local inExisting = false
-			for _, p in prompts_val do
-				if time >= p.startTime and time < p.endTime then
-					inExisting = true
-					break
-				end
-			end
-
-			if not inExisting then
-				local endTime = math.min(time + 2.0, appState.duration:get())
-				-- Check for next block overlap
-				for _, p in prompts_val do
-					if p.startTime > time and p.startTime < endTime then
-						endTime = p.startTime
-					end
-				end
-				if endTime - time < 0.5 then return end
-
-				local newPrompts = table.clone(prompts_val)
-				table.insert(newPrompts, {
-					text = "describe motion",
-					startTime = time,
-					endTime = endTime,
-				})
-				table.sort(newPrompts, function(a, b) return a.startTime < b.startTime end)
-				appState.prompts:set(newPrompts)
-			end
-		end
-	end)
+	-- Initial render (state may already be populated before subscribers connected)
+	renderPromptBlocks()
+	renderConstraints()
+	renderRuler()
 
 	return mainFrame
 end
@@ -1290,17 +1488,21 @@ widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	onWidgetEnabled()
 end)
 
--- Start with a default prompt if none
-task.defer(function()
-	if #appState.prompts:get() == 0 then
-		appState.prompts:set({
-			{
-				text = "a person waving",
-				startTime = 0,
-				endTime = appState.duration:get(),
-			},
-		})
-	end
-end)
+-- Seed a default prompt BEFORE building UI so the initial render shows it
+if #appState.prompts:get() == 0 then
+	appState.prompts:set({
+		{
+			text = "a person waving",
+			startTime = 0,
+			endTime = appState.duration:get(),
+		},
+	})
+end
+
+-- If the widget was left enabled across a place reload, the Enabled-changed
+-- signal won't fire — build the UI now so it isn't blank.
+if widget.Enabled then
+	onWidgetEnabled()
+end
 
 print("[RoMotion] Plugin loaded")

@@ -19,7 +19,6 @@ Constants.EFFECTORS = {
 	"LeftFoot",
 	"RightFoot",
 	"Hips",
-	"Root",
 }
 
 Constants.EFFECTOR_COLORS = {
@@ -28,7 +27,6 @@ Constants.EFFECTOR_COLORS = {
 	LeftFoot = Color3.fromRGB(102, 187, 106),  -- green
 	RightFoot = Color3.fromRGB(255, 167, 38),  -- orange
 	Hips = Color3.fromRGB(171, 71, 188),       -- purple
-	Root = Color3.fromRGB(255, 255, 255),      -- white
 }
 
 Constants.PROMPT_COLORS = {
@@ -42,6 +40,7 @@ Constants.PROMPT_COLORS = {
 
 Constants.TIMELINE_HEIGHT = 200
 Constants.RULER_HEIGHT = 24
+Constants.GUTTER = 86 -- left margin for effector labels/+buttons; time=0 starts here
 Constants.PROMPT_TRACK_HEIGHT = 36
 Constants.CONSTRAINT_TRACK_HEIGHT = 24
 Constants.PLAYHEAD_COLOR = Color3.fromRGB(255, 82, 82)

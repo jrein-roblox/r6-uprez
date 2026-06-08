@@ -90,7 +90,82 @@ local EFFECTOR_CHAINS = {
 	RightHand = { "LowerTorso", "UpperTorso", "RightUpperArm", "RightLowerArm", "RightHand" },
 	LeftFoot = { "LowerTorso", "LeftUpperLeg", "LeftLowerLeg", "LeftFoot" },
 	RightFoot = { "LowerTorso", "RightUpperLeg", "RightLowerLeg", "RightFoot" },
+	Hips = { "LowerTorso" }, -- Hips IS the root; just the one part
 }
+
+-- Detect velocity extrema (planted + swing moments) in a position track.
+-- positions: array of Vector3 (one per frame). Returns array of frame indices.
+-- Ported from python/effector_helpers.detect_velocity_extremes (XZ-speed).
+function RigService.detectVelocityExtrema(positions: { Vector3 }, minSeparation: number): { number }
+	local F = #positions
+	if F < 3 then
+		local all = {}
+		for i = 1, F do all[i] = i end
+		return all
+	end
+
+	-- XZ speed via central difference
+	local speed = table.create(F, 0)
+	for i = 2, F - 1 do
+		local dx = positions[i + 1].X - positions[i - 1].X
+		local dz = positions[i + 1].Z - positions[i - 1].Z
+		speed[i] = math.sqrt(dx * dx + dz * dz)
+	end
+	speed[1] = speed[2]
+	speed[F] = speed[F - 1]
+
+	-- Gaussian smooth (sigma ~1.5, radius 3)
+	local smooth = table.create(F, 0)
+	local kernel = { 0.106, 0.141, 0.165, 0.176, 0.165, 0.141, 0.106 }
+	for i = 1, F do
+		local sum, wsum = 0, 0
+		for k = -3, 3 do
+			local j = math.clamp(i + k, 1, F)
+			local w = kernel[k + 4]
+			sum += speed[j] * w
+			wsum += w
+		end
+		smooth[i] = sum / wsum
+	end
+
+	-- Find local minima (planted) and maxima (swing)
+	local minima, maxima = {}, {}
+	for i = 2, F - 1 do
+		local s, sp, sn = smooth[i], smooth[i - 1], smooth[i + 1]
+		if s <= sp and s <= sn then
+			table.insert(minima, i)
+		elseif s >= sp and s >= sn then
+			table.insert(maxima, i)
+		end
+	end
+
+	-- Non-max suppression: minima slowest-first, maxima fastest-first
+	local function nms(candidates: { number }, slowestFirst: boolean): { number }
+		table.sort(candidates, function(a, b)
+			if slowestFirst then return smooth[a] < smooth[b] else return smooth[a] > smooth[b] end
+		end)
+		local picked = {}
+		for _, f in candidates do
+			local ok = true
+			for _, p in picked do
+				if math.abs(f - p) < minSeparation then ok = false; break end
+			end
+			if ok then table.insert(picked, f) end
+		end
+		return picked
+	end
+
+	local pickedMin = nms(minima, true)
+	local pickedMax = nms(maxima, false)
+
+	-- Merge, dedupe, sort
+	local seen = {}
+	local combined = {}
+	for _, f in pickedMin do if not seen[f] then seen[f] = true; table.insert(combined, f) end end
+	for _, f in pickedMax do if not seen[f] then seen[f] = true; table.insert(combined, f) end end
+	table.sort(combined)
+	return combined
+end
 
 function RigService.getChainNames(effector: string): { string }
 	return EFFECTOR_CHAINS[effector] or {}
@@ -294,6 +369,48 @@ function RigService.readChainWorldCFrames(chain: ChainData, effector: string, gr
 	return result
 end
 
+
+-- Label a chain's effector part with a number billboard and tint the chain
+-- to `color` so it matches its timeline diamond.
+function RigService.labelChain(chain: ChainData, effector: string, ordinal: number, color: Color3)
+	local chainNames = EFFECTOR_CHAINS[effector]
+	if not chainNames then return end
+	local effPartName = chainNames[#chainNames]
+	local effPart = chain.parts[effPartName]
+	if not effPart then return end
+
+	-- Name the workspace model to match its UI number
+	chain.model.Name = "RoMotion_" .. effector .. "_" .. tostring(ordinal)
+
+	-- Tint all chain parts to the hue-shifted color
+	for _, part in chain.parts do
+		part.Color = color
+	end
+
+	-- Find or create the number billboard on the effector part
+	local billboard = effPart:FindFirstChild("RoMotion_Label") :: BillboardGui?
+	if not billboard then
+		billboard = Instance.new("BillboardGui")
+		billboard.Name = "RoMotion_Label"
+		billboard.Size = UDim2.new(0, 30, 0, 30)
+		billboard.AlwaysOnTop = true
+		billboard.Parent = effPart
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Name = "Num"
+		lbl.Size = UDim2.fromScale(1, 1)
+		lbl.BackgroundTransparency = 1
+		lbl.TextColor3 = Color3.new(1, 1, 1)
+		lbl.TextStrokeTransparency = 0
+		lbl.TextScaled = true
+		lbl.Font = Enum.Font.SourceSansBold
+		lbl.Parent = billboard
+	end
+	local lbl = billboard:FindFirstChild("Num") :: TextLabel
+	if lbl then
+		lbl.Text = effector .. " " .. tostring(ordinal)
+	end
+end
 
 function RigService.destroyChain(chain: ChainData)
 	for _, conn in chain.connections do

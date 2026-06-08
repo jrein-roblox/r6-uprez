@@ -65,6 +65,37 @@ function PlaybackService:loadFromCurveAnimation(curveAnim: CurveAnimation): bool
 	return true
 end
 
+function PlaybackService:loadFromAssetId(assetId: number): boolean
+	self:stop()
+	if self._curveAnimation then
+		self._curveAnimation:Destroy()
+		self._curveAnimation = nil
+	end
+
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://" .. tostring(assetId)
+
+	local ok, track = pcall(function()
+		return self._rig.animator:LoadAnimation(anim)
+	end)
+	if not ok or not track then
+		warn("[RoMotion] Failed to load asset animation:", track)
+		return false
+	end
+
+	self._track = track
+	-- Length populates asynchronously for asset animations; wait briefly
+	local waited = 0
+	while track.Length <= 0 and waited < 5 do
+		task.wait(0.1)
+		waited += 0.1
+	end
+	self._duration = if track.Length > 0 then track.Length else 3.0
+	self._track:Play(0, 1, 0)
+	self._state = "paused"
+	return true
+end
+
 function PlaybackService:loadFromInstance(curveAnimation: Instance)
 	self:stop()
 
@@ -167,14 +198,23 @@ function PlaybackService:seekTo(time: number)
 			self._renderConn = nil
 		end
 	end
-	-- Clamp to track for the actual animation, but report unclamped time
-	-- so the playhead can be positioned beyond the animation end
+	-- Use the LIVE track length (may differ from cached _duration if the
+	-- animation loaded asynchronously). Clamp the actual track time, but
+	-- report unclamped time so the playhead can move beyond the anim end.
+	local len = self._track.Length
+	if len > 0 then
+		self._duration = len
+	end
 	self._track.TimePosition = math.clamp(time, 0, self._duration)
 	self._rig.animator:StepAnimations(0)
 	self.TimeChanged:Fire(time)
 end
 
 function PlaybackService:getDuration(): number
+	-- Prefer the live track length over the cached value
+	if self._track and self._track.Length > 0 then
+		self._duration = self._track.Length
+	end
 	return self._duration
 end
 
