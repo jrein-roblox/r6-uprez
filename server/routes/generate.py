@@ -180,6 +180,8 @@ def build_kimodo_constraints(constraints: List[Constraint], total_duration: floa
         if c.target_rot:
             rot[0, skel.bone_index[joint_name]] = to_rot_mat(c.target_rot, joint_name)
 
+        # Hips + limbs all pin the full root (XZ + Y + heading): the effector's
+        # height is only meaningful relative to a known pelvis height.
         out.append(EndEffectorConstraintSet(
             skel,
             frame_indices=torch.tensor([frame_idx]),  # CPU (see Root2D note)

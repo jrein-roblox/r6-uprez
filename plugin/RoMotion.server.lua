@@ -121,13 +121,14 @@ local function placeConstraint(effector: string, time: number)
 	local effPart = RigService.getEffectorPart(rig, effector)
 	if not effPart then return end
 
-	-- Capture the body anchor (root + hips) from the rig's pose at this frame.
-	-- The user only ever moves the single effector gizmo; root/hips are read
-	-- automatically and used by the server to anchor the body + heading.
-	local body = RigService.captureBody(rig)
+	-- Root anchor: the rig's LowerTorso CFrame (3D, hip height — limb effectors
+	-- are pinned relative to the pelvis so height matters). createConstraintGizmo
+	-- projects this onto rigRestGroundY only for the flat Root (root2d) arrow.
+	local lt = RigService.getEffectorPart(rig, "Hips") -- LowerTorso
+	local rootCFrame = if lt then lt.CFrame else rig.rootPart.CFrame
 
 	local color = Constants.EFFECTOR_COLORS[effector] or Color3.new(1, 1, 1)
-	local gizmo = RigService.createConstraintGizmo(rig, effector, color, effPart.CFrame)
+	local gizmo = RigService.createConstraintGizmo(rig, effector, color, effPart.CFrame, rootCFrame, rigRestGroundY)
 
 	local constraints_val = table.clone(appState.constraints:get())
 	table.insert(constraints_val, {
@@ -135,7 +136,6 @@ local function placeConstraint(effector: string, time: number)
 		time = time,
 		cframe = effPart.CFrame,
 		gizmo = gizmo,
-		body = body,
 	})
 	table.sort(constraints_val, function(a, b) return a.time < b.time end)
 	appState.constraints:set(constraints_val)
@@ -748,8 +748,8 @@ local function buildUI()
 
 				local constraintsList = {}
 				for _, c in appState.constraints:get() do
-					if not (c.gizmo and c.body) then continue end
-					local t = RigService.readConstraintTarget(c.gizmo, groundCF, c.body)
+					if not c.gizmo then continue end
+					local t = RigService.readConstraintTarget(c.gizmo, groundCF)
 					table.insert(constraintsList, {
 						effector = c.effector,
 						time = c.time,
@@ -1395,10 +1395,12 @@ local function buildUI()
 				if input.UserInputType == Enum.UserInputType.MouseButton1 then
 					draggingConstraint = idx
 					selectedConstraint = idx
-					-- Select the gizmo part in the explorer/viewport
+					-- Select the effector + root gizmo parts in the explorer/viewport
 					local c = appState.constraints:get()[idx]
 					if c and c.gizmo then
-						Selection:Set({ c.gizmo.part })
+						local sel = { c.gizmo.effectorPart }
+						if c.gizmo.rootPart then table.insert(sel, c.gizmo.rootPart) end
+						Selection:Set(sel)
 					end
 					-- Re-highlight without full rebuild (we're mid-drag)
 					for di, d in constraintDiamonds do

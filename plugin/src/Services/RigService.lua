@@ -85,24 +85,6 @@ function RigService.getEffectorPart(rig: RigInfo, effector: string): BasePart?
 	return rig.model:FindFirstChild(partName, true) :: BasePart?
 end
 
--- Capture the body anchor (root + hips) from the rig's current pose. The
--- server uses root for root_y/smooth_root_2d and the two hips for heading.
--- All are world-space positions; the caller converts to ground space.
-export type BodyAnchor = { root: Vector3, hipL: Vector3, hipR: Vector3 }
-
-function RigService.captureBody(rig: RigInfo): BodyAnchor
-	local function pos(name: string, fallback: Vector3): Vector3
-		local p = rig.model:FindFirstChild(name, true) :: BasePart?
-		return if p and p:IsA("BasePart") then p.Position else fallback
-	end
-	local rootP = pos("LowerTorso", rig.rootPart.Position)
-	return {
-		root = rootP,
-		hipL = pos("LeftUpperLeg", rootP - rig.rootPart.CFrame.RightVector * 0.5),
-		hipR = pos("RightUpperLeg", rootP + rig.rootPart.CFrame.RightVector * 0.5),
-	}
-end
-
 -- Detect velocity extrema (planted + swing moments) in a position track.
 -- positions: array of Vector3 (one per frame). Returns array of frame indices.
 -- Ported from python/effector_helpers.detect_velocity_extremes (XZ-speed).
@@ -190,15 +172,27 @@ function RigService.detectVelocityExtrema(positions: { Vector3 }, minSeparation:
 end
 
 -- ════════════════════════════════════════════════════════════════════
--- Constraint gizmo: a single draggable/rotatable part marking one effector
--- target. The user moves it with Studio's native tools; on generate we read
--- its world CFrame in character (ground) space. No chain, no FK.
+-- Constraint gizmo(s): a draggable/rotatable effector part. For limbs we also
+-- spawn a second "root" part (sets root XZ/Y + heading via its orientation),
+-- joined to the effector by a Beam so the effector→root relationship is
+-- visible. The user positions both independently with Studio's native tools;
+-- on generate we read their world CFrames in character (ground) space.
+-- For Root/Hips the effector IS the pelvis, so there's no separate root part.
 -- ════════════════════════════════════════════════════════════════════
 
 export type Gizmo = {
-	part: BasePart,
+	effectorPart: BasePart,
+	rootPart: BasePart?, -- nil for Root/Hips (effector is the root)
+	beam: Beam?,
 	effector: string,
+	connections: { RBXScriptConnection },
 }
+
+local HIP_HALF_WIDTH = 0.5 -- studs; only the left→right direction matters (heading)
+
+local function isLimb(effector: string): boolean
+	return effector ~= "Root" and effector ~= "Hips"
+end
 
 local function quatFromCFrame(cf: CFrame): { number }
 	-- Returns {qx, qy, qz, qw} from a CFrame's rotation via axis-angle.
@@ -208,90 +202,266 @@ local function quatFromCFrame(cf: CFrame): { number }
 	return { axis.X * s, axis.Y * s, axis.Z * s, math.cos(half) }
 end
 
-function RigService.createConstraintGizmo(rig: RigInfo, effector: string, color: Color3, cframe: CFrame): Gizmo
-	local part = Instance.new("Part")
-	part.Name = "RoMotion_" .. effector
-	part.Size = Vector3.new(0.6, 0.6, 0.6)
-	part.CFrame = cframe
-	part.Anchored = true
-	part.CanCollide = false
-	part.CanQuery = true
-	part.CanTouch = false
-	part.Transparency = 0.3
-	part.Color = color
-	part.Material = Enum.Material.Neon
-	part.CastShadow = false
-	part.Parent = workspace
-
-	local sel = Instance.new("SelectionBox")
-	sel.Adornee = part
-	sel.Color3 = color
-	sel.LineThickness = 0.03
-	sel.Parent = part
-
+local function makeLabel(part: BasePart, text: string)
 	local billboard = Instance.new("BillboardGui")
 	billboard.Name = "RoMotion_Label"
-	billboard.Size = UDim2.new(0, 30, 0, 30)
+	billboard.Size = UDim2.new(0, 36, 0, 22)
 	billboard.AlwaysOnTop = true
 	billboard.Parent = part
 	local lbl = Instance.new("TextLabel")
 	lbl.Name = "Num"
 	lbl.Size = UDim2.fromScale(1, 1)
 	lbl.BackgroundTransparency = 1
+	lbl.Text = text
 	lbl.TextColor3 = Color3.new(1, 1, 1)
 	lbl.TextStrokeTransparency = 0
 	lbl.TextScaled = true
 	lbl.Font = Enum.Font.SourceSansBold
 	lbl.Parent = billboard
-
-	return { part = part, effector = effector }
 end
 
--- Read the gizmo target + captured body anchor, all in character (ground)
--- space. Returns the payload fields the server expects.
+local function addBoundingBox(part: BasePart, color: Color3)
+	local sel = Instance.new("SelectionBox")
+	sel.Adornee = part
+	sel.Color3 = color
+	sel.LineThickness = 0.03
+	sel.Parent = part
+end
+
+local function makePart(name: string, shape: Enum.PartType, size: number, color: Color3, transparency: number, cframe: CFrame): BasePart
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Shape = shape
+	part.Size = Vector3.new(size, size, size)
+	part.CFrame = cframe
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = true
+	part.CanTouch = false
+	part.Transparency = transparency
+	part.Color = color
+	part.Material = Enum.Material.Neon
+	part.CastShadow = false
+	part.Parent = workspace
+	addBoundingBox(part, color)
+	return part
+end
+
+-- Clone the rig's actual effector part so the gizmo has the real shape — much
+-- easier to orient than a generic cube. Strips joints/attachments/surface
+-- decals so it's a clean, tinted, translucent stand-in, plus a bounding box.
+local function cloneEffectorPart(rig: RigInfo, effector: string, color: Color3, cframe: CFrame): BasePart?
+	local src = RigService.getEffectorPart(rig, effector)
+	if not src or not src:IsA("BasePart") then return nil end
+
+	local clone = src:Clone()
+	for _, ch in clone:GetDescendants() do
+		if ch:IsA("JointInstance") or ch:IsA("Constraint") or ch:IsA("Attachment")
+			or ch:IsA("Bone") or ch:IsA("SurfaceAppearance") or ch:IsA("Decal")
+			or ch:IsA("Texture") or ch:IsA("BillboardGui") then
+			ch:Destroy()
+		end
+	end
+	clone.Name = "RoMotion_" .. effector
+	clone.Anchored = true
+	clone.CanCollide = false
+	clone.CanQuery = true
+	clone.CanTouch = false
+	clone.Massless = true
+	clone.CFrame = cframe
+	clone.Color = color
+	clone.Material = Enum.Material.SmoothPlastic -- keeps shape shading (Neon washes it out)
+	clone.Transparency = 0.3
+	clone.CastShadow = false
+	clone.Parent = workspace
+	addBoundingBox(clone, color)
+	return clone
+end
+
+-- A flat arrow lying on the ground, pointing +Z (the constrained facing). Used
+-- for root anchors so they read as "stand here, face this way" and aren't
+-- confused with the 3D Hips/torso gizmo. Returns the shaft (the part the user
+-- moves) and a connection that keeps the two arrowhead segments locked to it —
+-- welds don't resolve in Studio edit mode, so we reposition on CFrame change.
+local function buildGroundArrow(name: string, color: Color3, cframe: CFrame): (BasePart, RBXScriptConnection)
+	local shaft = Instance.new("Part")
+	shaft.Name = name
+	shaft.Size = Vector3.new(0.18, 0.08, 1.1)
+	shaft.CFrame = cframe
+	shaft.Anchored = true
+	shaft.CanCollide = false
+	shaft.CanQuery = true
+	shaft.CanTouch = false
+	shaft.Color = color
+	shaft.Material = Enum.Material.Neon
+	shaft.Transparency = 0.3
+	shaft.CastShadow = false
+	shaft.Parent = workspace
+	addBoundingBox(shaft, color)
+
+	-- Two angled segments at the -Z tip forming the arrowhead "V". -Z is the
+	-- facing direction (a part's LookVector is -Z), so the arrow points where
+	-- the character will face. Anchored and repositioned as the shaft moves.
+	local offsets: { [BasePart]: CFrame } = {}
+	for _, side in { -1, 1 } do
+		local head = Instance.new("Part")
+		head.Name = "Head"
+		head.Size = Vector3.new(0.18, 0.08, 0.55)
+		local localCF = CFrame.new(0, 0, -0.55) * CFrame.Angles(0, math.rad(side * 40), 0) * CFrame.new(0, 0, 0.27)
+		head.CFrame = shaft.CFrame * localCF
+		head.Anchored = true
+		head.CanCollide = false
+		head.CanQuery = true
+		head.CanTouch = false
+		head.Color = color
+		head.Material = Enum.Material.Neon
+		head.Transparency = 0.3
+		head.CastShadow = false
+		head.Parent = shaft
+		offsets[head] = localCF
+	end
+
+	local conn = shaft:GetPropertyChangedSignal("CFrame"):Connect(function()
+		for head, localCF in offsets do
+			head.CFrame = shaft.CFrame * localCF
+		end
+	end)
+	return shaft, conn
+end
+
+function RigService.createConstraintGizmo(
+	rig: RigInfo,
+	effector: string,
+	color: Color3,
+	effCFrame: CFrame,
+	rootCFrame: CFrame,
+	groundY: number
+): Gizmo
+	-- Root (2D path) effector: a flat ground arrow (position + facing). This is
+	-- the ONLY ground gizmo; it pins root XZ + heading, hip height free.
+	if effector == "Root" then
+		local _, yaw = rootCFrame:ToEulerAnglesYXZ()
+		local groundCF = CFrame.new(rootCFrame.X, groundY, rootCFrame.Z) * CFrame.fromEulerAnglesYXZ(0, yaw, 0)
+		local arrow, conn = buildGroundArrow("RoMotion_Root", color, groundCF)
+		makeLabel(arrow, "Root")
+		return { effectorPart = arrow, effector = effector, connections = { conn } }
+	end
+
+	-- Effector gizmo = a clone of the rig's real part (clear orientation) +
+	-- bounding box; falls back to a neon cube if the part can't be found.
+	local effectorPart = cloneEffectorPart(rig, effector, color, effCFrame)
+		or makePart("RoMotion_" .. effector, Enum.PartType.Block, 0.6, color, 0.3, effCFrame)
+	makeLabel(effectorPart, effector)
+
+	if not isLimb(effector) then
+		-- Hips: the effector IS the 3D pelvis pin; single torso gizmo, no link.
+		return { effectorPart = effectorPart, effector = effector, connections = {} }
+	end
+
+	-- Limb root anchor: a dimmed 3D LowerTorso clone at hip height. Hands/feet
+	-- are pinned RELATIVE to the pelvis, so its height matters — it is NOT a
+	-- ground marker. Its position sets root XZ/Y; its yaw sets heading.
+	local rootColor = color:Lerp(Color3.new(0.7, 0.7, 0.7), 0.45)
+	local rootPart = cloneEffectorPart(rig, "Root", rootColor, rootCFrame)
+		or makePart("RoMotion_Root", Enum.PartType.Ball, 0.5, rootColor, 0.5, rootCFrame)
+	rootPart.Name = "RoMotion_" .. effector .. "_Root"
+	rootPart.Transparency = 0.55
+	makeLabel(rootPart, "root")
+
+	-- Beam linking effector → root (auto-follows the parts as they move).
+	local a0 = Instance.new("Attachment"); a0.Name = "RoMotion_Link"; a0.Parent = effectorPart
+	local a1 = Instance.new("Attachment"); a1.Name = "RoMotion_Link"; a1.Parent = rootPart
+	local beam = Instance.new("Beam")
+	beam.Name = "RoMotion_Link"
+	beam.Attachment0 = a0
+	beam.Attachment1 = a1
+	beam.Color = ColorSequence.new(color)
+	beam.Width0 = 0.08
+	beam.Width1 = 0.08
+	beam.FaceCamera = true
+	beam.Segments = 1
+	beam.Transparency = NumberSequence.new(0.2)
+	beam.Parent = effectorPart
+
+	return {
+		effectorPart = effectorPart,
+		rootPart = rootPart,
+		beam = beam,
+		effector = effector,
+		connections = {},
+	}
+end
+
+-- Read the effector target + root anchor, all in character (ground) space.
+-- Root + hips come from the root gizmo (or the effector gizmo itself for
+-- Root/Hips); hips are synthesized from the root gizmo's orientation so its
+-- yaw drives the constrained heading.
 function RigService.readConstraintTarget(
 	gizmo: Gizmo,
-	groundCF: CFrame,
-	body: BodyAnchor
+	groundCF: CFrame
 ): { target: { number }, target_rot: { number }, root: { number }, hip_l: { number }, hip_r: { number } }
 	local function p(v: Vector3): { number }
 		local l = groundCF:PointToObjectSpace(v)
 		return { l.X, l.Y, l.Z }
 	end
+	local rootCF = (gizmo.rootPart or gizmo.effectorPart).CFrame
 	-- Rotation expressed relative to groundCF (yaw removed) so the server's
 	-- bind conversion is HRP-orientation independent.
-	local localCF = groundCF:ToObjectSpace(gizmo.part.CFrame)
+	local localCF = groundCF:ToObjectSpace(gizmo.effectorPart.CFrame)
 	return {
-		target = p(gizmo.part.Position),
+		target = p(gizmo.effectorPart.Position),
 		target_rot = quatFromCFrame(localCF),
-		root = p(body.root),
-		hip_l = p(body.hipL),
-		hip_r = p(body.hipR),
+		root = p(rootCF.Position),
+		hip_r = p((rootCF * CFrame.new(HIP_HALF_WIDTH, 0, 0)).Position),
+		hip_l = p((rootCF * CFrame.new(-HIP_HALF_WIDTH, 0, 0)).Position),
 	}
 end
 
 function RigService.labelGizmo(gizmo: Gizmo, ordinal: number, color: Color3)
-	gizmo.part.Name = "RoMotion_" .. gizmo.effector .. "_" .. tostring(ordinal)
-	gizmo.part.Color = color
-	local sel = gizmo.part:FindFirstChildOfClass("SelectionBox")
+	gizmo.effectorPart.Name = "RoMotion_" .. gizmo.effector .. "_" .. tostring(ordinal)
+	gizmo.effectorPart.Color = color
+	local sel = gizmo.effectorPart:FindFirstChildOfClass("SelectionBox")
 	if sel then sel.Color3 = color end
-	local billboard = gizmo.part:FindFirstChild("RoMotion_Label") :: BillboardGui?
+	local billboard = gizmo.effectorPart:FindFirstChild("RoMotion_Label") :: BillboardGui?
 	local lbl = billboard and billboard:FindFirstChild("Num") :: TextLabel?
 	if lbl then
 		lbl.Text = gizmo.effector .. " " .. tostring(ordinal)
 	end
+	if gizmo.rootPart then
+		local rl = (gizmo.rootPart:FindFirstChild("RoMotion_Label") :: BillboardGui?)
+		local rlbl = rl and rl:FindFirstChild("Num") :: TextLabel?
+		if rlbl then rlbl.Text = "root " .. tostring(ordinal) end
+	end
+	if gizmo.beam then gizmo.beam.Color = ColorSequence.new(color) end
 end
 
 function RigService.setGizmoVisible(gizmo: Gizmo, visible: boolean)
-	gizmo.part.Transparency = if visible then 0.3 else 1
-	local sel = gizmo.part:FindFirstChildOfClass("SelectionBox")
-	if sel then sel.Visible = visible end
-	local billboard = gizmo.part:FindFirstChild("RoMotion_Label") :: BillboardGui?
-	if billboard then billboard.Enabled = visible end
+	local function setPart(part: BasePart?)
+		if not part then return end
+		local t = if visible then (if part == gizmo.rootPart then 0.35 else 0.3) else 1
+		part.Transparency = t
+		-- Cover welded child parts (arrowhead segments) + adornments.
+		for _, d in part:GetDescendants() do
+			if d:IsA("BasePart") then
+				d.Transparency = t
+			elseif d:IsA("SelectionBox") then
+				d.Visible = visible
+			elseif d:IsA("BillboardGui") then
+				d.Enabled = visible
+			end
+		end
+	end
+	setPart(gizmo.effectorPart)
+	setPart(gizmo.rootPart)
+	if gizmo.beam then gizmo.beam.Enabled = visible end
 end
 
 function RigService.destroyGizmo(gizmo: Gizmo)
-	gizmo.part:Destroy()
+	for _, conn in gizmo.connections do
+		conn:Disconnect()
+	end
+	gizmo.effectorPart:Destroy()
+	if gizmo.rootPart then gizmo.rootPart:Destroy() end
 end
 
 return RigService
