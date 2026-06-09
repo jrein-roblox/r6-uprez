@@ -61,15 +61,18 @@ def generate_bvh(
     cfg_weight: List[float],  # [w] for regular, [text, constraint] for separated
     num_transition_frames: int,
     out_name: str,
-    constraints_path: Optional[Path] = None,
+    constraint_lst: Optional[list] = None,
 ) -> Path:
     """Run one warm generation, writing <clip_dir>/<out_name>.bvh (+ .npz).
+
+    `constraint_lst` is a list of pre-built Kimodo constraint objects
+    (EndEffectorConstraintSet / Root2DConstraintSet / ...). They are moved to
+    the model's device here.
 
     Returns the bvh path.
     """
     import torch
     from kimodo.tools import seed_everything
-    from kimodo.constraints import load_constraints_lst
     from kimodo.exports.bvh import save_motion_bvh
     from kimodo.exports.motion_io import save_kimodo_npz
     from kimodo.skeleton import SOMASkeleton30, global_rots_to_local_rots
@@ -83,9 +86,11 @@ def generate_bvh(
     if seed is not None:
         seed_everything(seed)
 
-    constraint_lst = []
-    if constraints_path and Path(constraints_path).is_file():
-        constraint_lst = load_constraints_lst(str(constraints_path), model.skeleton)
+    # Constraints are built on the skeleton's (CPU) device; the model's
+    # conditioning moves the assembled data dict to the model device itself
+    # (mirrors the original load_constraints_lst path — do NOT pre-move to
+    # device, which leaves index tensors split across CPU/MPS).
+    constraint_lst = constraint_lst or []
 
     cfg_kwargs = {}
     if cfg_type == "regular":

@@ -104,7 +104,7 @@ local function getLastFrameTime(): number
 end
 
 -- Place a constraint for `effector` at `time`, capturing the rig's current
--- pose. Seeks playback to `time` first so the chain is captured at that frame.
+-- pose. Seeks playback to `time` first so the body is captured at that frame.
 -- Shared by manual placement (label click) and auto-constraint.
 local function placeConstraint(effector: string, time: number)
 	local rig = appState.rig:get()
@@ -121,16 +121,21 @@ local function placeConstraint(effector: string, time: number)
 	local effPart = RigService.getEffectorPart(rig, effector)
 	if not effPart then return end
 
+	-- Capture the body anchor (root + hips) from the rig's pose at this frame.
+	-- The user only ever moves the single effector gizmo; root/hips are read
+	-- automatically and used by the server to anchor the body + heading.
+	local body = RigService.captureBody(rig)
+
 	local color = Constants.EFFECTOR_COLORS[effector] or Color3.new(1, 1, 1)
-	local chainModel = RigService.cloneChain(rig, effector, color)
-	if not chainModel then return end
+	local gizmo = RigService.createConstraintGizmo(rig, effector, color, effPart.CFrame)
 
 	local constraints_val = table.clone(appState.constraints:get())
 	table.insert(constraints_val, {
 		effector = effector,
 		time = time,
 		cframe = effPart.CFrame,
-		chain = chainModel,
+		gizmo = gizmo,
+		body = body,
 	})
 	table.sort(constraints_val, function(a, b) return a.time < b.time end)
 	appState.constraints:set(constraints_val)
@@ -486,8 +491,8 @@ local function buildUI()
 	appState.constraintsVisible:subscribe(function(visible)
 		visBtn.Text = if visible then "Hide" else "Show"
 		for _, c in appState.constraints:get() do
-			if c.chain and type(c.chain) == "table" and c.chain.parts then
-				RigService.setChainVisible(c.chain, visible)
+			if c.gizmo then
+				RigService.setGizmoVisible(c.gizmo, visible)
 			end
 		end
 	end)
@@ -733,8 +738,8 @@ local function buildUI()
 				local groundCF = CFrame.new(hrpPos.X, rigRestGroundY, hrpPos.Z)
 					* CFrame.fromEulerAnglesYXZ(0, hrpYaw, 0)
 
-				-- Root position is no longer used separately — it comes from the
-				-- chain's LowerTorso position (relative to HRP) via chain_world_cframes
+				-- Each constraint sends its effector gizmo target plus the body
+				-- anchor (root + hips) captured at placement, all in groundCF space.
 
 				-- Ensure animation is active so rig parts are at animated positions
 				if playbackSvc then
@@ -743,15 +748,16 @@ local function buildUI()
 
 				local constraintsList = {}
 				for _, c in appState.constraints:get() do
-					local chainCFrames = {}
-					if c.chain and type(c.chain) == "table" and c.chain.parts then
-						chainCFrames = RigService.readChainWorldCFrames(c.chain, c.effector, groundCF)
-					end
-
+					if not (c.gizmo and c.body) then continue end
+					local t = RigService.readConstraintTarget(c.gizmo, groundCF, c.body)
 					table.insert(constraintsList, {
 						effector = c.effector,
 						time = c.time,
-						chain_world_cframes = chainCFrames,
+						target = t.target,
+						target_rot = t.target_rot,
+						root = t.root,
+						hip_l = t.hip_l,
+						hip_r = t.hip_r,
 					})
 				end
 
@@ -886,8 +892,8 @@ local function buildUI()
 	-- Clear all constraints (and their workspace chain models)
 	clearBtn.MouseButton1Click:Connect(function()
 		for _, c in appState.constraints:get() do
-			if c.chain and type(c.chain) == "table" and c.chain.model then
-				RigService.destroyChain(c.chain)
+			if c.gizmo then
+				RigService.destroyGizmo(c.gizmo)
 			end
 		end
 		appState.constraints:set({})
@@ -1376,10 +1382,10 @@ local function buildUI()
 			numLbl.ZIndex = 6
 			numLbl.Parent = diamond
 
-			-- Update the matching world chain marker (number + hue + visibility)
-			if constraint.chain and type(constraint.chain) == "table" and constraint.chain.parts then
-				RigService.labelChain(constraint.chain, constraint.effector, ordinal, color)
-				RigService.setChainVisible(constraint.chain, appState.constraintsVisible:get())
+			-- Update the matching world gizmo marker (number + hue + visibility)
+			if constraint.gizmo then
+				RigService.labelGizmo(constraint.gizmo, ordinal, color)
+				RigService.setGizmoVisible(constraint.gizmo, appState.constraintsVisible:get())
 			end
 
 			local idx = i
@@ -1389,10 +1395,10 @@ local function buildUI()
 				if input.UserInputType == Enum.UserInputType.MouseButton1 then
 					draggingConstraint = idx
 					selectedConstraint = idx
-					-- Select the chain model in the explorer/viewport
+					-- Select the gizmo part in the explorer/viewport
 					local c = appState.constraints:get()[idx]
-					if c and c.chain and type(c.chain) == "table" and c.chain.model then
-						Selection:Set({ c.chain.model })
+					if c and c.gizmo then
+						Selection:Set({ c.gizmo.part })
 					end
 					-- Re-highlight without full rebuild (we're mid-drag)
 					for di, d in constraintDiamonds do
@@ -1408,8 +1414,8 @@ local function buildUI()
 					local updated = table.clone(appState.constraints:get())
 					local removed = table.remove(updated, idx)
 					if removed then
-						if removed.chain and type(removed.chain) == "table" and removed.chain.model then
-							RigService.destroyChain(removed.chain)
+						if removed.gizmo then
+							RigService.destroyGizmo(removed.gizmo)
 						end
 					end
 					appState.constraints:set(updated)

@@ -23,16 +23,21 @@ class PromptSegment(BaseModel):
     end_time: float
 
 
-class JointCFrame(BaseModel):
-    name: str
-    pos: List[float]   # position [x, y, z] in ground-centered Roblox studs
-    quat: List[float]  # quaternion [qx, qy, qz, qw] in world space
-
-
 class Constraint(BaseModel):
+    """A single sparse constraint authored as a character-space effector target.
+
+    All positions are ground/character-relative Roblox studs (HRP-centered,
+    yaw-removed). `target` is the only thing the user authors (the gizmo);
+    `root`/`hip_*` are captured automatically from the rig at the frame and
+    are used to anchor the body (root y/xz) and derive heading.
+    """
     effector: str
     time: float
-    chain_world_cframes: Optional[List[JointCFrame]] = None
+    target: List[float]                          # effector gizmo position [x, y, z]
+    target_rot: Optional[List[float]] = None     # effector rotation [qx, qy, qz, qw], char-relative
+    root: Optional[List[float]] = None           # LowerTorso position [x, y, z]
+    hip_l: Optional[List[float]] = None          # LeftUpperLeg position [x, y, z]
+    hip_r: Optional[List[float]] = None          # RightUpperLeg position [x, y, z]
 
 
 class GenerateRequest(BaseModel):
@@ -52,25 +57,16 @@ class GenerateResponse(BaseModel):
     status: str
 
 
-# PascalCase (Roblox) → snake_case (pipeline chain defs)
-PASCAL_TO_SNAKE = {
-    "LowerTorso": "lower_torso", "UpperTorso": "upper_torso",
-    "LeftUpperArm": "left_upper_arm", "LeftLowerArm": "left_lower_arm",
-    "LeftHand": "left_hand", "RightUpperArm": "right_upper_arm",
-    "RightLowerArm": "right_lower_arm", "RightHand": "right_hand",
-    "LeftUpperLeg": "left_upper_leg", "LeftLowerLeg": "left_lower_leg",
-    "LeftFoot": "left_foot", "RightUpperLeg": "right_upper_leg",
-    "RightLowerLeg": "right_lower_leg", "RightFoot": "right_foot",
-    "Head": "head",
-}
-
-# Plugin effector names → Kimodo constraint types
-EFF_MAP = {
-    "LeftFoot": ("left-foot", "LeftFoot"),
-    "RightFoot": ("right-foot", "RightFoot"),
-    "LeftHand": ("left-hand", "LeftHand"),
-    "RightHand": ("right-hand", "RightHand"),
-    "Hips": ("end-effector", "Hips"),  # Hips = SOMA root (joint 0)
+# Plugin effector → SOMA base-EE joint name (for expand_joint_names + bind).
+# Limbs and Hips are full end-effector constraints (global pos + rot). "Root"
+# is a special-cased root2d (XZ path + heading, hip height free).
+EFF_TO_JOINT = {
+    "LeftHand": "LeftHand",
+    "RightHand": "RightHand",
+    "LeftFoot": "LeftFoot",
+    "RightFoot": "RightFoot",
+    "Hips": "Hips",   # full 3D pelvis pin (joint 0 / root_idx)
+    # "Root" handled separately as root2d
 }
 
 # Position scale:
@@ -90,112 +86,111 @@ STUD_TO_KIMODO_Y = STUD_TO_METER  # 0.30
 
 
 def build_kimodo_constraints(constraints: List[Constraint], total_duration: float):
-    """Convert plugin constraints to Kimodo constraint format.
+    """Convert plugin constraints to Kimodo constraint **objects**.
 
-    Uses roblox_to_kimodo._retarget_chain_quats for proper R15→SOMA30 retargeting.
+    Builds EndEffectorConstraintSet / Root2DConstraintSet directly with sparse
+    global positions — no FK, no chain. Only the effector joint(+children),
+    the root, and the two hips are filled in `global_joints_positions`; the
+    constraint reads only those. The effector's SOMA global rotation comes from
+    the gizmo's world quat via the per-joint bind correction (see
+    roblox_to_kimodo._retarget_chain_quats: D[joint] = world * inv(bind)).
     """
     import numpy as np
+    import torch
+    import kimodo_warm
     import roblox_to_kimodo as r2k
-    from vendor.quat import to_scaled_angle_axis
+    from vendor import quat
+    from kimodo.geometry import axis_angle_to_matrix
+    from kimodo.constraints import EndEffectorConstraintSet, Root2DConstraintSet
 
-    SOMA30_N_JOINTS = 30
+    skel = kimodo_warm.load_model_once().skeleton
+    dev = getattr(skel, "device", "cpu")  # build on the model's device (e.g. mps)
+    J = skel.nbjoints
     fps = 30
     # Kimodo produces round(duration*fps) frames, indices 0..n_frames-1.
-    # (No +1: a 3s clip = 90 frames, last valid index is 89.)
     n_frames = int(round(total_duration * fps))
 
-    kimodo_constraints = []
+    def to_pos(p):
+        """Char-space studs [x,y,z] → Kimodo meters (Y-up, 180°-Y flip)."""
+        x, y, z = p
+        return np.array([-x * STUD_TO_KIMODO_XZ, y * STUD_TO_KIMODO_Y, -z * STUD_TO_KIMODO_XZ])
+
+    def to_rot_mat(quat_xyzw, joint_name):
+        """Char-space quat [qx,qy,qz,qw] → SOMA global rotation matrix (3,3)."""
+        qx, qy, qz, qw = quat_xyzw
+        R = np.array([qw, qx, qy, qz])                  # wxyz
+        Rk = r2k._quat_y180_conjugate(R)                # Roblox → Kimodo frame
+        bind = r2k.SOMA_BIND_CORRECTION.get(joint_name, r2k._BIND_IDENTITY)
+        soma_q = quat.mul(Rk, quat.inv(bind))           # D[joint] = global SOMA rot
+        aa = r2k._quat_to_axis_angle(soma_q[None, :])[0]
+        return axis_angle_to_matrix(torch.tensor(aa, dtype=torch.float32, device=dev))
+
+    out = []
     for c in constraints:
-        if c.effector not in EFF_MAP:
+        frame_idx = max(0, min(int(round(c.time * fps)), n_frames - 1))
+        target_k = to_pos(c.target)
+        root_k = to_pos(c.root) if c.root else target_k
+        # Hips for heading; fall back to a forward-facing pair around the root.
+        hip_r_k = to_pos(c.hip_r) if c.hip_r else root_k + np.array([0.1, 0.0, 0.0])
+        hip_l_k = to_pos(c.hip_l) if c.hip_l else root_k - np.array([0.1, 0.0, 0.0])
+
+        # ── Root (2D path): XZ + heading, hip height free ──
+        if c.effector == "Root":
+            diff = hip_r_k - hip_l_k
+            yaw = float(np.arctan2(diff[2], -diff[0]))
+            out.append(Root2DConstraintSet(
+                skel,
+                # frame_indices stays on CPU to match the index tensors the
+                # constraint builds internally (mirrors from_dict); only the
+                # data tensors live on the model device.
+                frame_indices=torch.tensor([frame_idx]),
+                smooth_root_2d=torch.tensor([[float(target_k[0]), float(target_k[2])]], dtype=torch.float32, device=dev),
+                global_root_heading=torch.tensor([[float(np.cos(yaw)), float(np.sin(yaw))]], dtype=torch.float32, device=dev),
+            ))
+            print(f"[generate] Root2D @f{frame_idx}: xz=({target_k[0]:.2f},{target_k[2]:.2f}) yaw={yaw:.2f}")
+            continue
+
+        joint_name = EFF_TO_JOINT.get(c.effector)
+        if joint_name is None:
             print(f"[generate] Skipping unsupported effector: {c.effector}")
             continue
 
-        cframes = c.chain_world_cframes
-        if not cframes:
-            print(f"[generate] No CFrame data for constraint, skipping")
-            continue
+        # ── Limb / Hips: full 3D end-effector (global pos + rot) ──
+        pos = torch.zeros(1, J, 3, device=dev)
+        rot = torch.eye(3, device=dev).reshape(1, 1, 3, 3).repeat(1, J, 1, 1)
 
-        ctype, joint_name = EFF_MAP[c.effector]
-        frame_idx = int(round(c.time * fps))
-        frame_idx = max(0, min(frame_idx, n_frames - 1))
+        def fill(idx, vec):
+            pos[0, idx] = torch.tensor(vec, dtype=torch.float32, device=dev)
 
-        # Convert CFrames to Kimodo space
-        chain_pos_kimodo = {}
-        chain_quat_kimodo = {}
-        for cf in cframes:
-            snake = PASCAL_TO_SNAKE.get(cf.name, cf.name)
-            px, py, pz = cf.pos
-            qx, qy, qz, qw = cf.quat
-            chain_pos_kimodo[snake] = np.array([
-                -px * STUD_TO_KIMODO_XZ,
-                 py * STUD_TO_KIMODO_Y,
-                -pz * STUD_TO_KIMODO_XZ,
-            ])
-            chain_quat_kimodo[snake] = np.array([qw, -qx, qy, -qz])  # wxyz
+        # Fill the effector's position joints (effector + leaf children).
+        _, pos_names = skel.expand_joint_names([joint_name])
+        for n in pos_names:
+            fill(skel.bone_index[n], target_k)
 
-        # Hips → root2d constraint (XZ position + heading). This is the
-        # canonical Kimodo way to constrain the root, and loads in the viewer.
-        if c.effector == "Hips":
-            lt = chain_pos_kimodo.get("lower_torso")
-            if lt is None:
-                continue
-            smooth_2d = [[float(lt[0]), float(lt[2])]]
-            entry = {
-                "type": "root2d",
-                "frame_indices": [frame_idx],
-                "smooth_root_2d": smooth_2d,
-            }
-            # Heading from hips Y rotation (cos, sin of yaw)
-            ltq = chain_quat_kimodo.get("lower_torso")
-            if ltq is not None:
-                w, x, y, z = ltq  # wxyz
-                # yaw from quaternion (rotation about Y)
-                yaw = np.arctan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + x * x))
-                entry["global_root_heading"] = [[float(np.cos(yaw)), float(np.sin(yaw))]]
-            print(f"[generate] Hips root2d at frame {frame_idx}: xz={smooth_2d}")
-            kimodo_constraints.append(entry)
-            continue
+        # Root index: the Hips gizmo IS the root; limbs use the captured body root.
+        root_fill = target_k if c.effector == "Hips" else root_k
+        fill(skel.root_idx, root_fill)
 
-        # Retarget chain rotations to SOMA30 using pipeline's proven function
-        local_rots = np.zeros((1, SOMA30_N_JOINTS, 3))
+        # Hips (heading). hip_joint_idx is ordered [right, left].
+        r_hip_idx, l_hip_idx = skel.hip_joint_idx
+        fill(r_hip_idx, hip_r_k)
+        fill(l_hip_idx, hip_l_k)
 
-        R15_CHAINS = getattr(r2k, 'R15_CHAINS', None)
-        if R15_CHAINS and ctype in R15_CHAINS:
-            chain_def = R15_CHAINS[ctype]
-            chain_rots = {
-                src_key: chain_quat_kimodo[src_key]
-                for _, src_key in chain_def
-                if src_key and src_key in chain_quat_kimodo
-            }
-            if chain_rots:
-                try:
-                    quats = r2k._retarget_chain_quats(chain_def, chain_rots)
-                    for soma_idx, q in quats.items():
-                        if q[0] < 0:
-                            q = -q
-                        local_rots[0, soma_idx] = to_scaled_angle_axis(q)
-                except Exception as e:
-                    print(f"[generate] Retarget failed: {e}")
+        # Effector rotation (only the effector joint's rotation is read).
+        if c.target_rot:
+            rot[0, skel.bone_index[joint_name]] = to_rot_mat(c.target_rot, joint_name)
 
-        # Root position from LowerTorso
-        if "lower_torso" in chain_pos_kimodo:
-            root_pos = chain_pos_kimodo["lower_torso"][None, :]
-        else:
-            root_pos = np.array([[0.0, 0.9, 0.0]])
+        out.append(EndEffectorConstraintSet(
+            skel,
+            frame_indices=torch.tensor([frame_idx]),  # CPU (see Root2D note)
+            global_joints_positions=pos,
+            global_joints_rots=rot,
+            smooth_root_2d=None,   # auto-derived from root index XZ
+            joint_names=[joint_name],
+        ))
+        print(f"[generate] {c.effector} @f{frame_idx}: target={np.round(target_k,2)} root_y={root_fill[1]:.2f}")
 
-        smooth_2d = root_pos[:, [0, 2]]
-
-        print(f"[generate] frame={frame_idx}, non-zero rots={np.count_nonzero(local_rots)}, root_y={root_pos[0,1]:.3f}")
-        kimodo_constraints.append({
-            "type": ctype,
-            "frame_indices": [frame_idx],
-            "local_joints_rot": local_rots.tolist(),
-            "root_positions": root_pos.tolist(),
-            "smooth_root_2d": smooth_2d.tolist(),
-            "joint_names": [joint_name],
-        })
-
-    return kimodo_constraints
+    return out
 
 
 @router.post("/generate", response_model=GenerateResponse)
@@ -231,12 +226,9 @@ def generate(req: GenerateRequest):
         # builds the CurveAnimation itself from r15.json).
         import kimodo_warm
 
-        def _run_pass(out_name: str, constraints, cfg_constraint_w: float):
+        def _run_pass(out_name: str, constraint_lst, cfg_constraint_w: float):
             """One kimodo pass (warm, in-process). With constraints → separated CFG."""
-            constraints_path = None
-            if constraints:
-                constraints_path = clip_dir / "constraints.json"
-                constraints_path.write_text(json.dumps(constraints, indent=2))
+            if constraint_lst:
                 cfg_type = "separated"
                 cfg_weight = [req.cfg_weight, cfg_constraint_w]
             else:
@@ -253,7 +245,7 @@ def generate(req: GenerateRequest):
                 cfg_weight=cfg_weight,
                 num_transition_frames=5,
                 out_name=out_name,
-                constraints_path=constraints_path,
+                constraint_lst=constraint_lst,
             )
 
         if req.looped:
@@ -265,10 +257,15 @@ def generate(req: GenerateRequest):
 
             n_loop = int(round(total_duration * 30))
             sample_frame = max(0, min(int(round(req.loop_offset * 30)), n_loop - 1))
-            loop_constraints = prompt_pipeline._build_loop_constraints(
+            # Loop pins come back as JSON-format dicts (whole-body pose from the
+            # pass-1 NPZ); load them into constraint objects to merge with the
+            # directly-built user objects.
+            loop_dicts = prompt_pipeline._build_loop_constraints(
                 clip_dir / "generated_pass1.npz", n_frames=n_loop, sample_frame=sample_frame,
             )
-            merged = loop_constraints + kimodo_constraints  # pins + user constraints
+            from kimodo.constraints import load_constraints_lst
+            loop_objs = load_constraints_lst(loop_dicts, kimodo_warm.load_model_once().skeleton)
+            merged = loop_objs + kimodo_constraints  # pins + user constraints
 
             job.message = "Loop pass 2/2..."
             job.progress = 0.4

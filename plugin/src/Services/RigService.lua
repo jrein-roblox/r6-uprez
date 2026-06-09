@@ -69,13 +69,14 @@ function RigService.isR15(rig: RigInfo): boolean
 end
 
 function RigService.getEffectorPart(rig: RigInfo, effector: string): BasePart?
+	-- Both Root (2D path) and Hips (3D pin) author the pelvis = LowerTorso.
 	local partName = ({
 		LeftHand = "LeftHand",
 		RightHand = "RightHand",
 		LeftFoot = "LeftFoot",
 		RightFoot = "RightFoot",
+		Root = "LowerTorso",
 		Hips = "LowerTorso",
-		Root = "HumanoidRootPart",
 	})[effector]
 
 	if not partName then
@@ -84,14 +85,23 @@ function RigService.getEffectorPart(rig: RigInfo, effector: string): BasePart?
 	return rig.model:FindFirstChild(partName, true) :: BasePart?
 end
 
--- Chain of part names from root to each effector
-local EFFECTOR_CHAINS = {
-	LeftHand = { "LowerTorso", "UpperTorso", "LeftUpperArm", "LeftLowerArm", "LeftHand" },
-	RightHand = { "LowerTorso", "UpperTorso", "RightUpperArm", "RightLowerArm", "RightHand" },
-	LeftFoot = { "LowerTorso", "LeftUpperLeg", "LeftLowerLeg", "LeftFoot" },
-	RightFoot = { "LowerTorso", "RightUpperLeg", "RightLowerLeg", "RightFoot" },
-	Hips = { "LowerTorso" }, -- Hips IS the root; just the one part
-}
+-- Capture the body anchor (root + hips) from the rig's current pose. The
+-- server uses root for root_y/smooth_root_2d and the two hips for heading.
+-- All are world-space positions; the caller converts to ground space.
+export type BodyAnchor = { root: Vector3, hipL: Vector3, hipR: Vector3 }
+
+function RigService.captureBody(rig: RigInfo): BodyAnchor
+	local function pos(name: string, fallback: Vector3): Vector3
+		local p = rig.model:FindFirstChild(name, true) :: BasePart?
+		return if p and p:IsA("BasePart") then p.Position else fallback
+	end
+	local rootP = pos("LowerTorso", rig.rootPart.Position)
+	return {
+		root = rootP,
+		hipL = pos("LeftUpperLeg", rootP - rig.rootPart.CFrame.RightVector * 0.5),
+		hipR = pos("RightUpperLeg", rootP + rig.rootPart.CFrame.RightVector * 0.5),
+	}
+end
 
 -- Detect velocity extrema (planted + swing moments) in a position track.
 -- positions: array of Vector3 (one per frame). Returns array of frame indices.
@@ -179,270 +189,109 @@ function RigService.detectVelocityExtrema(positions: { Vector3 }, minSeparation:
 	return combined
 end
 
-function RigService.getChainNames(effector: string): { string }
-	return EFFECTOR_CHAINS[effector] or {}
-end
+-- ════════════════════════════════════════════════════════════════════
+-- Constraint gizmo: a single draggable/rotatable part marking one effector
+-- target. The user moves it with Studio's native tools; on generate we read
+-- its world CFrame in character (ground) space. No chain, no FK.
+-- ════════════════════════════════════════════════════════════════════
 
-export type ChainData = {
-	model: Model,
-	parts: { [string]: BasePart },
-	joints: { { part0Name: string, part1Name: string, c0: CFrame, c1: CFrame } },
-	connections: { RBXScriptConnection },
+export type Gizmo = {
+	part: BasePart,
+	effector: string,
 }
 
--- Clone the full chain as anchored parts with FK cascade on manipulation.
--- When user rotates any part, children re-position via FK.
-function RigService.cloneChain(rig: RigInfo, effector: string, color: Color3): ChainData?
-	local chainNames = EFFECTOR_CHAINS[effector]
-	if not chainNames then return nil end
+local function quatFromCFrame(cf: CFrame): { number }
+	-- Returns {qx, qy, qz, qw} from a CFrame's rotation via axis-angle.
+	local axis, angle = cf:ToAxisAngle()
+	local half = angle / 2
+	local s = math.sin(half)
+	return { axis.X * s, axis.Y * s, axis.Z * s, math.cos(half) }
+end
 
-	local model = Instance.new("Model")
-	model.Name = "RoMotion_Chain_" .. effector
+function RigService.createConstraintGizmo(rig: RigInfo, effector: string, color: Color3, cframe: CFrame): Gizmo
+	local part = Instance.new("Part")
+	part.Name = "RoMotion_" .. effector
+	part.Size = Vector3.new(0.6, 0.6, 0.6)
+	part.CFrame = cframe
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = true
+	part.CanTouch = false
+	part.Transparency = 0.3
+	part.Color = color
+	part.Material = Enum.Material.Neon
+	part.CastShadow = false
+	part.Parent = workspace
 
-	local clonedParts: { [string]: BasePart } = {}
-	local joints: { { part0Name: string, part1Name: string, c0: CFrame, c1: CFrame } } = {}
+	local sel = Instance.new("SelectionBox")
+	sel.Adornee = part
+	sel.Color3 = color
+	sel.LineThickness = 0.03
+	sel.Parent = part
 
-	-- Capture joint data and compute animated CFrames via FK.
-	-- In edit mode, parts stay at rest positions even when animated —
-	-- only joint.Transform gets updated. We must FK manually.
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "RoMotion_Label"
+	billboard.Size = UDim2.new(0, 30, 0, 30)
+	billboard.AlwaysOnTop = true
+	billboard.Parent = part
+	local lbl = Instance.new("TextLabel")
+	lbl.Name = "Num"
+	lbl.Size = UDim2.fromScale(1, 1)
+	lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = Color3.new(1, 1, 1)
+	lbl.TextStrokeTransparency = 0
+	lbl.TextScaled = true
+	lbl.Font = Enum.Font.SourceSansBold
+	lbl.Parent = billboard
 
-	-- First: gather joint info for the full chain (including root→LowerTorso)
-	type JointInfo = { part0Name: string, part1Name: string, c0: CFrame, c1: CFrame, transform: CFrame }
-	local allJoints: { JointInfo } = {}
+	return { part = part, effector = effector }
+end
 
-	for _, partName in chainNames do
-		local joint = rig.motors[partName]
-		if not joint then continue end
-
-		local part0Name: string
-		local c0: CFrame
-		local c1: CFrame
-		local transform: CFrame
-
-		if joint:IsA("Motor6D") then
-			part0Name = joint.Part0 and joint.Part0.Name or ""
-			c0 = joint.C0
-			c1 = joint.C1
-			transform = joint.Transform
-		elseif joint.ClassName == "AnimationConstraint" then
-			part0Name = joint.Attachment0 and joint.Attachment0.Parent and joint.Attachment0.Parent.Name or ""
-			c0 = joint.Attachment0 and joint.Attachment0.CFrame or CFrame.identity
-			c1 = joint.Attachment1 and joint.Attachment1.CFrame or CFrame.identity
-			transform = joint.Transform
-		else
-			continue
-		end
-
-		table.insert(allJoints, {
-			part0Name = part0Name,
-			part1Name = partName,
-			c0 = c0,
-			c1 = c1,
-			transform = transform,
-		})
+-- Read the gizmo target + captured body anchor, all in character (ground)
+-- space. Returns the payload fields the server expects.
+function RigService.readConstraintTarget(
+	gizmo: Gizmo,
+	groundCF: CFrame,
+	body: BodyAnchor
+): { target: { number }, target_rot: { number }, root: { number }, hip_l: { number }, hip_r: { number } }
+	local function p(v: Vector3): { number }
+		local l = groundCF:PointToObjectSpace(v)
+		return { l.X, l.Y, l.Z }
 	end
-
-	-- FK from HumanoidRootPart through the chain to get animated CFrames
-	local animatedCF: { [string]: CFrame } = {}
-	animatedCF["HumanoidRootPart"] = rig.rootPart.CFrame
-
-	-- Also grab CFrame of any parent part not in chain (as FK seed)
-	for _, j in allJoints do
-		if not animatedCF[j.part0Name] then
-			local parentPart = rig.model:FindFirstChild(j.part0Name, true)
-			if parentPart and parentPart:IsA("BasePart") then
-				animatedCF[j.part0Name] = parentPart.CFrame
-			end
-		end
-		-- FK: child = parent * C0 * Transform * C1:Inverse()
-		local parentCF = animatedCF[j.part0Name] or CFrame.identity
-		animatedCF[j.part1Name] = parentCF * j.c0 * j.transform * j.c1:Inverse()
-	end
-
-	-- Create cloned parts at animated positions
-	local effectorName = chainNames[#chainNames]
-	for _, partName in chainNames do
-		local srcPart = rig.model:FindFirstChild(partName, true) :: BasePart?
-		if not srcPart or not srcPart:IsA("BasePart") then continue end
-
-		local isEffector = (partName == effectorName)
-		local clone = Instance.new("Part")
-		clone.Name = partName
-		clone.Size = srcPart.Size
-		clone.CFrame = animatedCF[partName] or srcPart.CFrame
-		clone.Anchored = true
-		clone.CanCollide = false
-		clone.CanQuery = true
-		clone.CanTouch = false
-		clone.Transparency = if isEffector then 0.3 else 0.6
-		clone.Color = color
-		clone.Material = if isEffector then Enum.Material.Neon else Enum.Material.ForceField
-		clone.CastShadow = false
-		clone.Parent = model
-		clonedParts[partName] = clone
-
-		-- Add selection box on the effector for visibility
-		if isEffector then
-			local sel = Instance.new("SelectionBox")
-			sel.Adornee = clone
-			sel.Color3 = color
-			sel.LineThickness = 0.03
-			sel.Parent = clone
-		end
-	end
-
-	-- Store joints (only those with both parts in the chain) for readChainTransforms
-	for _, j in allJoints do
-		if clonedParts[j.part0Name] then
-			table.insert(joints, {
-				part0Name = j.part0Name,
-				part1Name = j.part1Name,
-				c0 = j.c0,
-				c1 = j.c1,
-			})
-		end
-	end
-
-	model.Parent = workspace
-
-	-- Set up FK cascade: when a part's CFrame changes, update all children below it
-	local connections: { RBXScriptConnection } = {}
-	local isUpdating = false
-
-	local function fkFromPart(startIdx: number)
-		if isUpdating then return end
-		isUpdating = true
-		-- Re-FK all joints from startIdx onward
-		for i = startIdx, #joints do
-			local j = joints[i]
-			local part0 = clonedParts[j.part0Name]
-			local part1 = clonedParts[j.part1Name]
-			if part0 and part1 then
-				-- Motor6D equation: Part1.CFrame = Part0.CFrame * C0 * Transform * C1:Inverse()
-				-- Since we want to preserve current Transform, compute Part1 from Part0
-				-- Transform = C0:Inv * Part0.CFrame:Inv * Part1.CFrame * C1 (current)
-				-- But we want to CASCADE from parent change, so recompute Part1:
-				-- We store the "local rotation" as the delta from rest
-				local currentTransform = j.c0:Inverse() * part0.CFrame:Inverse() * part1.CFrame * j.c1
-				part1.CFrame = part0.CFrame * j.c0 * currentTransform * j.c1:Inverse()
-			end
-		end
-		isUpdating = false
-	end
-
-	-- Listen for CFrame changes on each part to cascade FK
-	for i, partName in chainNames do
-		local part = clonedParts[partName]
-		if part then
-			local partIdx = i
-			local conn = part:GetPropertyChangedSignal("CFrame"):Connect(function()
-				if isUpdating then return end
-				-- Find which joint index this part is Part0 of, and FK from there
-				for ji, j in joints do
-					if j.part0Name == partName then
-						fkFromPart(ji)
-						break
-					end
-				end
-			end)
-			table.insert(connections, conn)
-		end
-	end
-
+	-- Rotation expressed relative to groundCF (yaw removed) so the server's
+	-- bind conversion is HRP-orientation independent.
+	local localCF = groundCF:ToObjectSpace(gizmo.part.CFrame)
 	return {
-		model = model,
-		parts = clonedParts,
-		joints = joints,
-		connections = connections,
+		target = p(gizmo.part.Position),
+		target_rot = quatFromCFrame(localCF),
+		root = p(body.root),
+		hip_l = p(body.hipL),
+		hip_r = p(body.hipR),
 	}
 end
 
--- Read world CFrames from chain parts (user-poseable constraint visualization).
-function RigService.readChainWorldCFrames(chain: ChainData, effector: string, groundCF: CFrame): { { name: string, pos: { number }, quat: { number } } }
-	local chainNames = EFFECTOR_CHAINS[effector]
-	if not chainNames then return {} end
-
-	local result = {}
-	for _, partName in chainNames do
-		local part = chain.parts[partName]
-		if part then
-			local cf = part.CFrame
-			local localPos = groundCF:PointToObjectSpace(cf.Position)
-			local axis, angle = cf:ToAxisAngle()
-			local halfAngle = angle / 2
-			local sinHalf = math.sin(halfAngle)
-			table.insert(result, {
-				name = partName,
-				pos = { localPos.X, localPos.Y, localPos.Z },
-				quat = { axis.X * sinHalf, axis.Y * sinHalf, axis.Z * sinHalf, math.cos(halfAngle) },
-			})
-		end
-	end
-	return result
-end
-
-
--- Label a chain's effector part with a number billboard and tint the chain
--- to `color` so it matches its timeline diamond.
-function RigService.labelChain(chain: ChainData, effector: string, ordinal: number, color: Color3)
-	local chainNames = EFFECTOR_CHAINS[effector]
-	if not chainNames then return end
-	local effPartName = chainNames[#chainNames]
-	local effPart = chain.parts[effPartName]
-	if not effPart then return end
-
-	-- Name the workspace model to match its UI number
-	chain.model.Name = "RoMotion_" .. effector .. "_" .. tostring(ordinal)
-
-	-- Tint all chain parts to the hue-shifted color
-	for _, part in chain.parts do
-		part.Color = color
-	end
-
-	-- Find or create the number billboard on the effector part
-	local billboard = effPart:FindFirstChild("RoMotion_Label") :: BillboardGui?
-	if not billboard then
-		billboard = Instance.new("BillboardGui")
-		billboard.Name = "RoMotion_Label"
-		billboard.Size = UDim2.new(0, 30, 0, 30)
-		billboard.AlwaysOnTop = true
-		billboard.Parent = effPart
-
-		local lbl = Instance.new("TextLabel")
-		lbl.Name = "Num"
-		lbl.Size = UDim2.fromScale(1, 1)
-		lbl.BackgroundTransparency = 1
-		lbl.TextColor3 = Color3.new(1, 1, 1)
-		lbl.TextStrokeTransparency = 0
-		lbl.TextScaled = true
-		lbl.Font = Enum.Font.SourceSansBold
-		lbl.Parent = billboard
-	end
-	local lbl = billboard:FindFirstChild("Num") :: TextLabel
+function RigService.labelGizmo(gizmo: Gizmo, ordinal: number, color: Color3)
+	gizmo.part.Name = "RoMotion_" .. gizmo.effector .. "_" .. tostring(ordinal)
+	gizmo.part.Color = color
+	local sel = gizmo.part:FindFirstChildOfClass("SelectionBox")
+	if sel then sel.Color3 = color end
+	local billboard = gizmo.part:FindFirstChild("RoMotion_Label") :: BillboardGui?
+	local lbl = billboard and billboard:FindFirstChild("Num") :: TextLabel?
 	if lbl then
-		lbl.Text = effector .. " " .. tostring(ordinal)
+		lbl.Text = gizmo.effector .. " " .. tostring(ordinal)
 	end
 end
 
--- Show or hide all of a chain's visuals (parts + number billboard + outline).
-function RigService.setChainVisible(chain: ChainData, visible: boolean)
-	for _, part in chain.parts do
-		part.Transparency = if visible then 0.5 else 1
-		for _, child in part:GetChildren() do
-			if child:IsA("BillboardGui") then
-				child.Enabled = visible
-			elseif child:IsA("SelectionBox") then
-				child.Visible = visible
-			end
-		end
-	end
+function RigService.setGizmoVisible(gizmo: Gizmo, visible: boolean)
+	gizmo.part.Transparency = if visible then 0.3 else 1
+	local sel = gizmo.part:FindFirstChildOfClass("SelectionBox")
+	if sel then sel.Visible = visible end
+	local billboard = gizmo.part:FindFirstChild("RoMotion_Label") :: BillboardGui?
+	if billboard then billboard.Enabled = visible end
 end
 
-function RigService.destroyChain(chain: ChainData)
-	for _, conn in chain.connections do
-		conn:Disconnect()
-	end
-	chain.model:Destroy()
+function RigService.destroyGizmo(gizmo: Gizmo)
+	gizmo.part:Destroy()
 end
 
 return RigService

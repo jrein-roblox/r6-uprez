@@ -24,7 +24,15 @@ end
 
 function BackendService.generate(request: {
 	prompts: { { text: string, start_time: number, end_time: number } },
-	constraints: { { effector: string, time: number, position: { number } } }?,
+	constraints: { {
+		effector: string,
+		time: number,
+		target: { number },
+		target_rot: { number }?,
+		root: { number }?,
+		hip_l: { number }?,
+		hip_r: { number }?,
+	} }?,
 	duration: number,
 	looped: boolean?,
 	loop_offset: number?,

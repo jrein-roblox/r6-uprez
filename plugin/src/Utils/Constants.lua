@@ -18,7 +18,8 @@ Constants.EFFECTORS = {
 	"RightHand",
 	"LeftFoot",
 	"RightFoot",
-	"Hips",
+	"Root", -- root2d: XZ path + heading (hip height free)
+	"Hips", -- full 3D pelvis pin (XYZ + heading + rotation)
 }
 
 Constants.EFFECTOR_COLORS = {
@@ -26,6 +27,7 @@ Constants.EFFECTOR_COLORS = {
 	RightHand = Color3.fromRGB(239, 83, 80),   -- red
 	LeftFoot = Color3.fromRGB(102, 187, 106),  -- green
 	RightFoot = Color3.fromRGB(255, 167, 38),  -- orange
+	Root = Color3.fromRGB(120, 144, 156),      -- blue-grey
 	Hips = Color3.fromRGB(171, 71, 188),       -- purple
 }
 
