@@ -103,6 +103,21 @@ local function getLastFrameTime(): number
 	return (n - 1) / Constants.FPS
 end
 
+-- Remove a constraint (by its table reference) and tear down its gizmo.
+-- Idempotent: a no-op if it's already gone, so it's safe to call from both the
+-- UI delete paths and the DataModel watchers (which feed back into here).
+local function removeConstraint(c: any)
+	local list = appState.constraints:get()
+	local idx = table.find(list, c)
+	if not idx then return end
+	local updated = table.clone(list)
+	table.remove(updated, idx)
+	if c.gizmo then
+		RigService.destroyGizmo(c.gizmo) -- disconnects its watchers first, so this won't re-enter
+	end
+	appState.constraints:set(updated)
+end
+
 -- Place a constraint for `effector` at `time`, capturing the rig's current
 -- pose. Seeks playback to `time` first so the body is captured at that frame.
 -- Shared by manual placement (label click) and auto-constraint.
@@ -130,13 +145,29 @@ local function placeConstraint(effector: string, time: number)
 	local color = Constants.EFFECTOR_COLORS[effector] or Color3.new(1, 1, 1)
 	local gizmo = RigService.createConstraintGizmo(rig, effector, color, effPart.CFrame, rootCFrame, rigRestGroundY)
 
-	local constraints_val = table.clone(appState.constraints:get())
-	table.insert(constraints_val, {
+	local entry = {
 		effector = effector,
 		time = time,
 		cframe = effPart.CFrame,
 		gizmo = gizmo,
-	})
+	}
+
+	-- Two-way sync: if the user deletes a gizmo part in the DataModel, drop the
+	-- matching UI constraint. Watchers live in gizmo.connections so destroyGizmo
+	-- disconnects them before its own :Destroy() calls (no feedback loop).
+	local function watch(part: BasePart?)
+		if not part then return end
+		table.insert(gizmo.connections, part.AncestryChanged:Connect(function()
+			if not part:IsDescendantOf(game) then
+				removeConstraint(entry)
+			end
+		end))
+	end
+	watch(gizmo.effectorPart)
+	watch(gizmo.rootPart)
+
+	local constraints_val = table.clone(appState.constraints:get())
+	table.insert(constraints_val, entry)
 	table.sort(constraints_val, function(a, b) return a.time < b.time end)
 	appState.constraints:set(constraints_val)
 end
@@ -1447,17 +1478,10 @@ local function buildUI()
 				end
 			end)
 
-			-- Right-click to delete constraint (and its chain)
+			-- Right-click to delete constraint (and its gizmo)
 			diamond.InputBegan:Connect(function(input)
 				if input.UserInputType == Enum.UserInputType.MouseButton2 then
-					local updated = table.clone(appState.constraints:get())
-					local removed = table.remove(updated, idx)
-					if removed then
-						if removed.gizmo then
-							RigService.destroyGizmo(removed.gizmo)
-						end
-					end
-					appState.constraints:set(updated)
+					removeConstraint(constraint)
 				end
 			end)
 
