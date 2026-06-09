@@ -187,7 +187,6 @@ export type Gizmo = {
 	beam: Beam?,
 	effector: string,
 	connections: { RBXScriptConnection },
-	lookFrom: Vector3?, -- Look gizmos: captured head world pos (gaze origin)
 }
 
 local HIP_HALF_WIDTH = 0.5 -- studs; only the left→right direction matters (heading)
@@ -343,14 +342,32 @@ function RigService.createConstraintGizmo(
 	rootCFrame: CFrame,
 	groundY: number
 ): Gizmo
-	-- Look (head gaze): a target ball the head orients toward. effCFrame is the
-	-- rig's Head CFrame; place the target a few studs along its look direction.
+	-- Look (head gaze): two gizmos joined by a beam (the gaze ray) — a target
+	-- ball (where to look) and an origin ball (where the head is). The head's
+	-- constrained orientation is lookAt(origin → target), so when you crouch you
+	-- drop the origin and the aim tilts up to the target. effCFrame = Head CFrame.
 	if effector == "Look" then
 		local headPos = effCFrame.Position
-		local targetCF = CFrame.new(headPos + effCFrame.LookVector * 3)
-		local ball = makePart("RoMotion_Look", Enum.PartType.Ball, 0.5, color, 0.2, targetCF)
-		makeLabel(ball, "look")
-		return { effectorPart = ball, effector = effector, connections = {}, lookFrom = headPos }
+		local target = makePart("RoMotion_Look", Enum.PartType.Ball, 0.5, color, 0.2, CFrame.new(headPos + effCFrame.LookVector * 3))
+		makeLabel(target, "look")
+		local origin = makePart("RoMotion_Look_From", Enum.PartType.Ball, 0.4, color:Lerp(Color3.new(0.7, 0.7, 0.7), 0.45), 0.5, CFrame.new(headPos))
+		makeLabel(origin, "from")
+
+		local a0 = Instance.new("Attachment"); a0.Name = "RoMotion_Link"; a0.Parent = target
+		local a1 = Instance.new("Attachment"); a1.Name = "RoMotion_Link"; a1.Parent = origin
+		local beam = Instance.new("Beam")
+		beam.Name = "RoMotion_Link"
+		beam.Attachment0 = a0
+		beam.Attachment1 = a1
+		beam.Color = ColorSequence.new(color)
+		beam.Width0 = 0.06
+		beam.Width1 = 0.06
+		beam.FaceCamera = true
+		beam.Segments = 1
+		beam.Transparency = NumberSequence.new(0.2)
+		beam.Parent = target
+
+		return { effectorPart = target, rootPart = origin, beam = beam, effector = effector, connections = {} }
 	end
 
 	-- Root (2D path) effector: a flat ground arrow (position + facing). This is
@@ -423,13 +440,16 @@ function RigService.readConstraintTarget(
 	end
 
 	-- Look: target_rot is the head orientation facing the target from the
-	-- captured gaze origin. No root/hips (rotation-only head constraint).
+	-- user-placed gaze origin (the "from" gizmo). No root/hips (rotation-only).
 	if gizmo.effector == "Look" then
-		local from = gizmo.lookFrom or gizmo.effectorPart.Position
-		local lookWorld = CFrame.lookAt(from, gizmo.effectorPart.Position)
+		local from = if gizmo.rootPart then gizmo.rootPart.Position else gizmo.effectorPart.Position
+		local to = gizmo.effectorPart.Position
+		local lookWorld = if (to - from).Magnitude > 1e-3
+			then CFrame.lookAt(from, to)
+			else CFrame.new(from) -- origin == target: no meaningful direction
 		local localCF = groundCF:ToObjectSpace(lookWorld)
 		return {
-			target = p(gizmo.effectorPart.Position),
+			target = p(to),
 			target_rot = quatFromCFrame(localCF),
 		}
 	end
@@ -460,7 +480,8 @@ function RigService.labelGizmo(gizmo: Gizmo, ordinal: number, color: Color3)
 	if gizmo.rootPart then
 		local rl = (gizmo.rootPart:FindFirstChild("RoMotion_Label") :: BillboardGui?)
 		local rlbl = rl and rl:FindFirstChild("Num") :: TextLabel?
-		if rlbl then rlbl.Text = "root " .. tostring(ordinal) end
+		local subName = if gizmo.effector == "Look" then "from" else "root"
+		if rlbl then rlbl.Text = subName .. " " .. tostring(ordinal) end
 	end
 	if gizmo.beam then gizmo.beam.Color = ColorSequence.new(color) end
 end
