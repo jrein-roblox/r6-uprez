@@ -77,6 +77,7 @@ function RigService.getEffectorPart(rig: RigInfo, effector: string): BasePart?
 		RightFoot = "RightFoot",
 		Root = "LowerTorso",
 		Hips = "LowerTorso",
+		Look = "Head",
 	})[effector]
 
 	if not partName then
@@ -182,10 +183,11 @@ end
 
 export type Gizmo = {
 	effectorPart: BasePart,
-	rootPart: BasePart?, -- nil for Root/Hips (effector is the root)
+	rootPart: BasePart?, -- nil for Root/Hips/Look (effector is the root, or none)
 	beam: Beam?,
 	effector: string,
 	connections: { RBXScriptConnection },
+	lookFrom: Vector3?, -- Look gizmos: captured head world pos (gaze origin)
 }
 
 local HIP_HALF_WIDTH = 0.5 -- studs; only the left→right direction matters (heading)
@@ -337,6 +339,16 @@ function RigService.createConstraintGizmo(
 	rootCFrame: CFrame,
 	groundY: number
 ): Gizmo
+	-- Look (head gaze): a target ball the head orients toward. effCFrame is the
+	-- rig's Head CFrame; place the target a few studs along its look direction.
+	if effector == "Look" then
+		local headPos = effCFrame.Position
+		local targetCF = CFrame.new(headPos + effCFrame.LookVector * 3)
+		local ball = makePart("RoMotion_Look", Enum.PartType.Ball, 0.5, color, 0.2, targetCF)
+		makeLabel(ball, "look")
+		return { effectorPart = ball, effector = effector, connections = {}, lookFrom = headPos }
+	end
+
 	-- Root (2D path) effector: a flat ground arrow (position + facing). This is
 	-- the ONLY ground gizmo; it pins root XZ + heading, hip height free.
 	if effector == "Root" then
@@ -404,6 +416,19 @@ function RigService.readConstraintTarget(
 		local l = groundCF:PointToObjectSpace(v)
 		return { l.X, l.Y, l.Z }
 	end
+
+	-- Look: target_rot is the head orientation facing the target from the
+	-- captured gaze origin. No root/hips (rotation-only head constraint).
+	if gizmo.effector == "Look" then
+		local from = gizmo.lookFrom or gizmo.effectorPart.Position
+		local lookWorld = CFrame.lookAt(from, gizmo.effectorPart.Position)
+		local localCF = groundCF:ToObjectSpace(lookWorld)
+		return {
+			target = p(gizmo.effectorPart.Position),
+			target_rot = quatFromCFrame(localCF),
+		}
+	end
+
 	local rootCF = (gizmo.rootPart or gizmo.effectorPart).CFrame
 	-- Rotation expressed relative to groundCF (yaw removed) so the server's
 	-- bind conversion is HRP-orientation independent.

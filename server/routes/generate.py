@@ -101,7 +101,7 @@ def build_kimodo_constraints(constraints: List[Constraint], total_duration: floa
     import roblox_to_kimodo as r2k
     from vendor import quat
     from kimodo.geometry import axis_angle_to_matrix
-    from kimodo.constraints import EndEffectorConstraintSet, Root2DConstraintSet
+    from kimodo.constraints import EndEffectorConstraintSet, Root2DConstraintSet, create_pairs
 
     skel = kimodo_warm.load_model_once().skeleton
     dev = getattr(skel, "device", "cpu")  # build on the model's device (e.g. mps)
@@ -109,6 +109,38 @@ def build_kimodo_constraints(constraints: List[Constraint], total_duration: floa
     fps = 30
     # Kimodo produces round(duration*fps) frames, indices 0..n_frames-1.
     n_frames = int(round(total_duration * fps))
+
+    # Window (frames each side of the keyframe) over which a head-look is held.
+    # Head orientation is somewhat out-of-distribution, so a single frame gets
+    # washed out; a sustained window makes the gaze actually take effect.
+    LOOK_HALF_WINDOW = 10
+
+    class HeadLookConstraint(EndEffectorConstraintSet):
+        """Constrains only the Head joint's global rotation (gaze direction) on
+        the given frames — no position, no root (rotation constraints have no
+        root requirement). Bypasses expand_joint_names (which rejects "Head")."""
+
+        def __init__(self, skeleton, frame_indices, global_joints_rots, head_idx):
+            self.skeleton = skeleton
+            self.frame_indices = frame_indices
+            self.head_idx = head_idx
+            self.rot_indices = torch.tensor([head_idx])
+            self.pos_indices = torch.tensor([], dtype=torch.long)
+            self.global_joints_rots = global_joints_rots
+
+        def update_constraints(self, data_dict, index_dict):
+            crop = torch.arange(len(self.frame_indices), device=self.frame_indices.device)
+            data_dict["global_joints_rots"].append(self.global_joints_rots[tuple(create_pairs(crop, self.rot_indices).T)])
+            index_dict["global_joints_rots"].append(create_pairs(self.frame_indices, self.rot_indices))
+
+        def crop_move(self, start, end):
+            mask = (self.frame_indices >= start) & (self.frame_indices < end)
+            return HeadLookConstraint(self.skeleton, self.frame_indices[mask] - start, self.global_joints_rots[mask], self.head_idx)
+
+        def to(self, device=None, dtype=None):
+            self.frame_indices = self.frame_indices.to(device=device) if device else self.frame_indices
+            self.global_joints_rots = self.global_joints_rots.to(device=device) if device else self.global_joints_rots
+            return self
 
     def to_pos(p):
         """Char-space studs [x,y,z] → Kimodo meters (Y-up, 180°-Y flip)."""
@@ -126,8 +158,26 @@ def build_kimodo_constraints(constraints: List[Constraint], total_duration: floa
         return axis_angle_to_matrix(torch.tensor(aa, dtype=torch.float32, device=dev))
 
     out = []
+    head_idx = skel.bone_index.get("Head")
     for c in constraints:
         frame_idx = max(0, min(int(round(c.time * fps)), n_frames - 1))
+
+        # ── Look (head gaze): constrain the Head joint's global rotation over a
+        # window. target_rot is the look orientation (computed plugin-side from
+        # the head→target direction). No position / no root. ──
+        if c.effector == "Look":
+            if head_idx is None or not c.target_rot:
+                print("[generate] Look constraint skipped (no Head joint / rotation)")
+                continue
+            mat = to_rot_mat(c.target_rot, "Head")  # Head: identity bind
+            lo, hi = max(0, frame_idx - LOOK_HALF_WINDOW), min(n_frames - 1, frame_idx + LOOK_HALF_WINDOW)
+            frames = list(range(lo, hi + 1))
+            rot = torch.eye(3, device=dev).reshape(1, 1, 3, 3).repeat(len(frames), J, 1, 1)
+            rot[:, head_idx] = mat
+            out.append(HeadLookConstraint(skel, torch.tensor(frames), rot, head_idx))
+            print(f"[generate] Look @f{frame_idx} (window {lo}-{hi})")
+            continue
+
         target_k = to_pos(c.target)
         root_k = to_pos(c.root) if c.root else target_k
         # Hips for heading; fall back to a forward-facing pair around the root.

@@ -18,8 +18,9 @@ Constants.EFFECTORS = {
 	"RightHand",
 	"LeftFoot",
 	"RightFoot",
-	"Root", -- root2d: XZ path + heading (hip height free)
 	"Hips", -- full 3D pelvis pin (XYZ + heading + rotation)
+	"Root", -- root2d: XZ path + heading (hip height free)
+	"Look", -- head gaze: orient the head toward a look-at target
 }
 
 Constants.EFFECTOR_COLORS = {
@@ -29,6 +30,7 @@ Constants.EFFECTOR_COLORS = {
 	RightFoot = Color3.fromRGB(255, 167, 38),  -- orange
 	Root = Color3.fromRGB(120, 144, 156),      -- blue-grey
 	Hips = Color3.fromRGB(171, 71, 188),       -- purple
+	Look = Color3.fromRGB(255, 235, 59),       -- yellow
 }
 
 Constants.PROMPT_COLORS = {

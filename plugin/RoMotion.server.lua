@@ -852,9 +852,11 @@ local function buildUI()
 
 			appState.generationMessage:set("Analyzing motion...")
 
-			-- Sample each effector's HRP-local position at every frame
+			-- Sample each effector's HRP-local position at every frame, plus the
+			-- head's body-relative gaze direction (for auto Look targets).
 			local samples: { [string]: { Vector3 } } = {}
 			for _, e in effectors do samples[e] = {} end
+			local gaze: { Vector3 } = {}
 
 			for f = 0, nFrames - 1 do
 				local t = f / fps
@@ -869,6 +871,10 @@ local function buildUI()
 						samples[e][f + 1] = Vector3.zero
 					end
 				end
+				local head = RigService.getEffectorPart(rig, "Look") -- Head
+				gaze[f + 1] = if head
+					then rig.rootPart.CFrame:VectorToObjectSpace(head.CFrame.LookVector)
+					else Vector3.zero
 			end
 
 			-- Detect extrema per effector, collect (effector, time) pairs
@@ -878,6 +884,12 @@ local function buildUI()
 				for _, f in frames do
 					table.insert(picks, { effector = e, time = (f - 1) / fps })
 				end
+			end
+
+			-- Look targets at gaze-direction extrema (wider separation so we
+			-- don't drop a look target at every footstep).
+			for _, f in RigService.detectVelocityExtrema(gaze, 15) do
+				table.insert(picks, { effector = "Look", time = (f - 1) / fps })
 			end
 
 			-- Place a constraint at each detected pose
