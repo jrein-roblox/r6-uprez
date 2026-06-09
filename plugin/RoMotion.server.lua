@@ -69,7 +69,7 @@ local appState = {
 	selectedConstraints = State.new({} :: { number }), -- indices into constraints
 	looped = State.new(false),
 	loopOffset = State.new(0),
-	constraintsVisible = State.new(true),
+	constraintVisMode = State.new("show"), -- "show" | "hide" | "local"
 	seed = State.new(0),
 	serverConnected = State.new(false),
 }
@@ -482,18 +482,44 @@ local function buildUI()
 	local importBtn = makeButton("Import", "Import")
 	importBtn.Size = UDim2.new(0, 56, 0, 26)
 
-	-- Toggle constraint visibility (parts + number labels)
-	local visBtn = makeButton("ToggleVis", "Hide")
-	visBtn.Size = UDim2.new(0, 48, 0, 26)
-	visBtn.MouseButton1Click:Connect(function()
-		appState.constraintsVisible:set(not appState.constraintsVisible:get())
-	end)
-	appState.constraintsVisible:subscribe(function(visible)
-		visBtn.Text = if visible then "Hide" else "Show"
+	-- Constraint visibility: show / hide / local. In "local" mode constraints
+	-- fade with distance from the playhead (full at the playhead, gone at
+	-- ±LOCAL_VIS_WINDOW frames) so dense timelines stay readable.
+	local LOCAL_VIS_WINDOW = 5
+	local function applyConstraintVisibility()
+		local mode = appState.constraintVisMode:get()
+		local now = appState.playbackTime:get()
 		for _, c in appState.constraints:get() do
-			if c.gizmo then
-				RigService.setGizmoVisible(c.gizmo, visible)
+			if not c.gizmo then continue end
+			local alpha
+			if mode == "hide" then
+				alpha = 0
+			elseif mode == "local" then
+				local distFrames = math.abs((c.time - now) * Constants.FPS)
+				alpha = math.clamp(1 - distFrames / LOCAL_VIS_WINDOW, 0, 1)
+			else
+				alpha = 1
 			end
+			RigService.setGizmoAlpha(c.gizmo, alpha)
+		end
+	end
+
+	-- Cycle show → local → hide; button shows the current mode.
+	local visBtn = makeButton("ToggleVis", "Show") -- matches default mode "show"
+	visBtn.Size = UDim2.new(0, 52, 0, 26)
+	local VIS_NEXT = { show = "local", ["local"] = "hide", hide = "show" }
+	local VIS_LABEL = { show = "Show", ["local"] = "Local", hide = "Hide" }
+	visBtn.MouseButton1Click:Connect(function()
+		appState.constraintVisMode:set(VIS_NEXT[appState.constraintVisMode:get()])
+	end)
+	appState.constraintVisMode:subscribe(function(mode)
+		visBtn.Text = VIS_LABEL[mode] or "Show"
+		applyConstraintVisibility()
+	end)
+	-- Re-fade as the playhead moves while in local mode.
+	appState.playbackTime:subscribe(function()
+		if appState.constraintVisMode:get() == "local" then
+			applyConstraintVisibility()
 		end
 	end)
 
@@ -1394,10 +1420,9 @@ local function buildUI()
 			numLbl.ZIndex = 6
 			numLbl.Parent = diamond
 
-			-- Update the matching world gizmo marker (number + hue + visibility)
+			-- Update the matching world gizmo marker (number + hue)
 			if constraint.gizmo then
 				RigService.labelGizmo(constraint.gizmo, ordinal, color)
-				RigService.setGizmoVisible(constraint.gizmo, appState.constraintsVisible:get())
 			end
 
 			local idx = i
@@ -1438,6 +1463,9 @@ local function buildUI()
 
 			table.insert(constraintDiamonds, diamond)
 		end
+
+		-- Apply show/hide/local fade to the freshly-labelled gizmos.
+		applyConstraintVisibility()
 	end
 
 	-- Handle constraint diamond dragging

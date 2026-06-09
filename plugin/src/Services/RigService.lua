@@ -241,6 +241,7 @@ local function makePart(name: string, shape: Enum.PartType, size: number, color:
 	part.CanQuery = true
 	part.CanTouch = false
 	part.Transparency = transparency
+	part:SetAttribute("RoMotionBase", transparency)
 	part.Color = color
 	part.Material = Enum.Material.Neon
 	part.CastShadow = false
@@ -274,6 +275,7 @@ local function cloneEffectorPart(rig: RigInfo, effector: string, color: Color3, 
 	clone.Color = color
 	clone.Material = Enum.Material.SmoothPlastic -- keeps shape shading (Neon washes it out)
 	clone.Transparency = 0.3
+	clone:SetAttribute("RoMotionBase", 0.3)
 	clone.CastShadow = false
 	clone.Parent = workspace
 	addBoundingBox(clone, color)
@@ -297,6 +299,7 @@ local function buildGroundArrow(name: string, color: Color3, cframe: CFrame): (B
 	shaft.Color = color
 	shaft.Material = Enum.Material.Neon
 	shaft.Transparency = 0.3
+	shaft:SetAttribute("RoMotionBase", 0.3)
 	shaft.CastShadow = false
 	shaft.Parent = workspace
 	addBoundingBox(shaft, color)
@@ -318,6 +321,7 @@ local function buildGroundArrow(name: string, color: Color3, cframe: CFrame): (B
 		head.Color = color
 		head.Material = Enum.Material.Neon
 		head.Transparency = 0.3
+		head:SetAttribute("RoMotionBase", 0.3)
 		head.CastShadow = false
 		head.Parent = shaft
 		offsets[head] = localCF
@@ -378,6 +382,7 @@ function RigService.createConstraintGizmo(
 		or makePart("RoMotion_Root", Enum.PartType.Ball, 0.5, rootColor, 0.5, rootCFrame)
 	rootPart.Name = "RoMotion_" .. effector .. "_Root"
 	rootPart.Transparency = 0.55
+	rootPart:SetAttribute("RoMotionBase", 0.55)
 	makeLabel(rootPart, "root")
 
 	-- Beam linking effector → root (auto-follows the parts as they move).
@@ -460,25 +465,44 @@ function RigService.labelGizmo(gizmo: Gizmo, ordinal: number, color: Color3)
 	if gizmo.beam then gizmo.beam.Color = ColorSequence.new(color) end
 end
 
-function RigService.setGizmoVisible(gizmo: Gizmo, visible: boolean)
-	local function setPart(part: BasePart?)
+-- Fade a gizmo by alpha (1 = fully visible at its base transparency, 0 = gone).
+-- Each part stores its shown transparency in the "RoMotionBase" attribute so we
+-- can fade toward fully transparent linearly. Used for the "local" focus mode.
+local function partAlpha(part: BasePart, alpha: number)
+	local base = part:GetAttribute("RoMotionBase")
+	if typeof(base) ~= "number" then base = 0.3 end
+	part.Transparency = 1 - alpha * (1 - base)
+end
+
+function RigService.setGizmoAlpha(gizmo: Gizmo, alpha: number)
+	local on = alpha > 0.02
+	local function apply(part: BasePart?)
 		if not part then return end
-		local t = if visible then (if part == gizmo.rootPart then 0.35 else 0.3) else 1
-		part.Transparency = t
-		-- Cover welded child parts (arrowhead segments) + adornments.
+		partAlpha(part, alpha)
 		for _, d in part:GetDescendants() do
 			if d:IsA("BasePart") then
-				d.Transparency = t
+				partAlpha(d, alpha)
 			elseif d:IsA("SelectionBox") then
-				d.Visible = visible
+				d.Visible = on
+				d.Transparency = 1 - alpha -- fade the bounding-box lines
 			elseif d:IsA("BillboardGui") then
-				d.Enabled = visible
+				d.Enabled = on
+			elseif d:IsA("TextLabel") then
+				d.TextTransparency = 1 - alpha
+				d.TextStrokeTransparency = 1 - alpha
 			end
 		end
 	end
-	setPart(gizmo.effectorPart)
-	setPart(gizmo.rootPart)
-	if gizmo.beam then gizmo.beam.Enabled = visible end
+	apply(gizmo.effectorPart)
+	apply(gizmo.rootPart)
+	if gizmo.beam then
+		gizmo.beam.Enabled = on
+		gizmo.beam.Transparency = NumberSequence.new(1 - alpha * (1 - 0.2))
+	end
+end
+
+function RigService.setGizmoVisible(gizmo: Gizmo, visible: boolean)
+	RigService.setGizmoAlpha(gizmo, if visible then 1 else 0)
 end
 
 function RigService.destroyGizmo(gizmo: Gizmo)
