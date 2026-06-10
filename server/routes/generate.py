@@ -85,6 +85,7 @@ STUD_TO_KIMODO_XZ = 1.0 / (100.0 * CM_TO_STUD * HRP_SCALE)  # ≈0.303 at scale 
 STUD_TO_KIMODO_Y = STUD_TO_METER  # 0.30
 
 
+
 def build_kimodo_constraints(constraints: List[Constraint], total_duration: float):
     """Convert plugin constraints to Kimodo constraint **objects**.
 
@@ -245,6 +246,7 @@ def build_kimodo_constraints(constraints: List[Constraint], total_duration: floa
     return out
 
 
+
 @router.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
     from main import job_manager, WORK_DIR
@@ -347,6 +349,10 @@ def generate(req: GenerateRequest):
         )
         if offset != 0.0:
             r15_json_path.write_text(json.dumps(result, separators=(",", ":")))
+
+        # NOTE: no per-frame effector targets — the plugin IK-blends each
+        # constrained hand to its own gizmo transform (it already has the
+        # constraints), so the server just returns the raw retarget.
 
         job.message = "Done"
         job.progress = 1.0

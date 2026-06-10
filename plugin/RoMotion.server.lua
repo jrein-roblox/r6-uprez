@@ -118,6 +118,19 @@ local function removeConstraint(c: any)
 	appState.constraints:set(updated)
 end
 
+-- Flip a constraint between hard (IK-pinned) and soft (model influence only).
+-- Soft is the default; renderConstraints re-styles the diamond + gizmo to match.
+local function togglePin(idx: number)
+	local list = appState.constraints:get()
+	local c = list[idx]
+	if not c then return end
+	local updated = table.clone(list)
+	local nc = table.clone(c)
+	nc.pinned = not (c.pinned == true)
+	updated[idx] = nc
+	appState.constraints:set(updated)
+end
+
 -- Place a constraint for `effector` at `time`, capturing the rig's current
 -- pose. Seeks playback to `time` first so the body is captured at that frame.
 -- Shared by manual placement (label click) and auto-constraint.
@@ -150,6 +163,7 @@ local function placeConstraint(effector: string, time: number)
 		time = time,
 		cframe = effPart.CFrame,
 		gizmo = gizmo,
+		pinned = false, -- soft by default; double-click the diamond to hard-pin
 	}
 
 	-- Two-way sync: if the user deletes a gizmo part in the DataModel, drop the
@@ -601,6 +615,12 @@ local function buildUI()
 	local constraintDiamonds: { Frame } = {}
 	local draggingConstraint: number? = nil
 	local selectedConstraint: number? = nil
+	-- Manual double-click tracking (diamonds rebuild each render, so this lives
+	-- in the outer scope): a second MB1 on the same constraint within the window
+	-- toggles its hard/soft pin instead of starting a drag.
+	local lastClickIdx: number? = nil
+	local lastClickTime = 0
+	local DOUBLE_CLICK_SEC = 0.35
 	local renderConstraints: () -> ()
 
 	for i, effName in Constants.EFFECTORS do
@@ -849,7 +869,7 @@ local function buildUI()
 						local resultData = BackendService.getResult(resp.job_id)
 
 						-- Build CurveAnimation from the JSON data
-						local curveAnim = AnimationBuilder.build(resultData.animation)
+						local curveAnim = AnimationBuilder.build(resultData.animation, rig, appState.constraints:get())
 
 						if playbackSvc then
 							playbackSvc:destroy()
@@ -1436,9 +1456,18 @@ local function buildUI()
 			diamond.BorderSizePixel = if i == selectedConstraint then 2 else 0
 			diamond.BorderColor3 = Color3.new(1, 1, 1)
 			diamond.Parent = effTrack
+			-- Hard pins read solid (opaque fill + white ring); soft pins read
+			-- hollow (translucent fill + thin colored outline). Double-click toggles.
+			local pinned = constraint.pinned == true
+			diamond.BackgroundTransparency = if pinned then 0 else 0.65
 			local diamondCorner = Instance.new("UICorner")
 			diamondCorner.CornerRadius = UDim.new(0, 3)
 			diamondCorner.Parent = diamond
+			local pinStroke = Instance.new("UIStroke")
+			pinStroke.Thickness = if pinned then 2 else 1
+			pinStroke.Color = if pinned then Color3.new(1, 1, 1) else color
+			pinStroke.Transparency = if pinned then 0 else 0.15
+			pinStroke.Parent = diamond
 
 			-- Number label on the diamond
 			local numLbl = Instance.new("TextLabel")
@@ -1451,16 +1480,27 @@ local function buildUI()
 			numLbl.ZIndex = 6
 			numLbl.Parent = diamond
 
-			-- Update the matching world gizmo marker (number + hue)
+			-- Update the matching world gizmo marker (number + hue + pin opacity)
 			if constraint.gizmo then
 				RigService.labelGizmo(constraint.gizmo, ordinal, color)
+				RigService.setGizmoPinned(constraint.gizmo, pinned)
 			end
 
 			local idx = i
 
-			-- Left-click: select (UI + DataModel) and start drag
+			-- Left-click: select (UI + DataModel) and start drag.
+			-- Double-click (same diamond, quick) toggles hard/soft pin.
 			diamond.InputBegan:Connect(function(input)
 				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					local t = os.clock()
+					if lastClickIdx == idx and (t - lastClickTime) < DOUBLE_CLICK_SEC then
+						lastClickIdx = nil
+						draggingConstraint = nil
+						togglePin(idx)
+						return
+					end
+					lastClickIdx = idx
+					lastClickTime = t
 					draggingConstraint = idx
 					selectedConstraint = idx
 					-- Select the effector + root gizmo parts in the explorer/viewport

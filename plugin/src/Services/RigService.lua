@@ -526,12 +526,69 @@ function RigService.setGizmoVisible(gizmo: Gizmo, visible: boolean)
 	RigService.setGizmoAlpha(gizmo, if visible then 1 else 0)
 end
 
+-- Mirror a constraint's hard/soft pin state on its gizmo: hard pins are opaque,
+-- soft pins keep their translucent default. We stash the original (soft) base
+-- transparency in "RoMotionSoftBase" so toggling back restores the exact look.
+-- Callers should re-run their visibility pass afterward (it reads RoMotionBase).
+function RigService.setGizmoPinned(gizmo: Gizmo, pinned: boolean)
+	local function one(p: BasePart)
+		local soft = p:GetAttribute("RoMotionSoftBase")
+		if typeof(soft) ~= "number" then
+			local cur = p:GetAttribute("RoMotionBase")
+			soft = if typeof(cur) == "number" then cur else 0.3
+			p:SetAttribute("RoMotionSoftBase", soft)
+		end
+		p:SetAttribute("RoMotionBase", if pinned then 0 else soft)
+	end
+	local function apply(part: BasePart?)
+		if not part then return end
+		one(part)
+		for _, d in part:GetDescendants() do
+			if d:IsA("BasePart") then one(d) end
+		end
+	end
+	apply(gizmo.effectorPart)
+	apply(gizmo.rootPart)
+end
+
 function RigService.destroyGizmo(gizmo: Gizmo)
 	for _, conn in gizmo.connections do
 		conn:Disconnect()
 	end
 	gizmo.effectorPart:Destroy()
 	if gizmo.rootPart then gizmo.rootPart:Destroy() end
+end
+
+-- ════════════════════════════════════════════════════════════════════
+-- Rig rest geometry for FK/IK (the IK bake in AnimationBuilder).
+-- For each child part: its parent's name and the joint's C0/C1 (attachment
+-- CFrames). FK identity (same as the old cloneChain): for a joint on the
+-- child, childWorld = parentWorld * C0 * Transform * C1:Inverse().
+-- ════════════════════════════════════════════════════════════════════
+
+export type JointGeom = { parentName: string, c0: CFrame, c1: CFrame }
+
+function RigService.getRigGeometry(rig: RigInfo): { [string]: JointGeom }
+	local geom: { [string]: JointGeom } = {}
+	for partName, joint in rig.motors do
+		local parentName: string?
+		local c0, c1: CFrame, CFrame
+		if joint:IsA("Motor6D") then
+			parentName = joint.Part0 and joint.Part0.Name or nil
+			c0, c1 = joint.C0, joint.C1
+		elseif joint.ClassName == "AnimationConstraint" then
+			local a0, a1 = joint.Attachment0, joint.Attachment1
+			parentName = a0 and a0.Parent and a0.Parent.Name or nil
+			c0 = a0 and a0.CFrame or CFrame.identity
+			c1 = a1 and a1.CFrame or CFrame.identity
+		else
+			continue
+		end
+		if parentName then
+			geom[partName] = { parentName = parentName, c0 = c0, c1 = c1 }
+		end
+	end
+	return geom
 end
 
 return RigService

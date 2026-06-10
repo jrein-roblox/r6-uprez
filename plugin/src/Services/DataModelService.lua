@@ -16,6 +16,7 @@ export type ConstraintData = {
 	effector: string,
 	time: number,
 	cframe: CFrame,
+	pinned: boolean?,
 }
 
 export type ProjectData = {
@@ -120,6 +121,7 @@ function DataModelService.save(rigName: string, project: ProjectData)
 			local cfVal = Instance.new("CFrameValue")
 			cfVal.Name = string.format("%.3f", constraint.time)
 			cfVal.Value = constraint.cframe
+			cfVal:SetAttribute("Pinned", constraint.pinned == true)
 			cfVal.Parent = effFolder
 		end
 	end
@@ -189,6 +191,7 @@ function DataModelService.load(rigName: string, projectName: string): ProjectDat
 							effector = effFolder.Name,
 							time = time,
 							cframe = cfVal.Value,
+							pinned = cfVal:GetAttribute("Pinned") == true,
 						})
 					end
 				end
