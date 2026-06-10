@@ -71,6 +71,7 @@ local appState = {
 	loopOffset = State.new(0),
 	constraintVisMode = State.new("show"), -- "show" | "hide" | "local"
 	seed = State.new(0),
+	lastSeed = State.new(0), -- the seed Kimodo actually used on the last gen (for "copy seed")
 	serverConnected = State.new(false),
 }
 
@@ -357,6 +358,44 @@ local function buildUI()
 
 	appState.seed:subscribe(function(s)
 		seedInput.Text = tostring(s)
+	end)
+
+	-- "Copy seed" — Roblox exposes no clipboard-write API to plugins, so we put
+	-- the last-used seed into the seed box (committing it as the active seed, so
+	-- it persists) and select it; the user presses Ctrl+C.
+	local copySeedBtn = Instance.new("TextButton")
+	copySeedBtn.Name = "CopySeed"
+	copySeedBtn.Size = UDim2.new(0, 44, 0, 20)
+	copySeedBtn.BackgroundColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.Button)
+	copySeedBtn.TextColor3 = settings().Studio.Theme:GetColor(Enum.StudioStyleGuideColor.ButtonText)
+	copySeedBtn.Text = "⧉ Copy"
+	copySeedBtn.TextSize = 11
+	copySeedBtn.Font = Enum.Font.SourceSansBold
+	copySeedBtn.AutoButtonColor = false -- dimmed until the first generation
+	copySeedBtn.TextTransparency = 0.5
+	copySeedBtn.LayoutOrder = 7
+	copySeedBtn.Parent = topBar
+	local copySeedCorner = Instance.new("UICorner")
+	copySeedCorner.CornerRadius = UDim.new(0, 3)
+	copySeedCorner.Parent = copySeedBtn
+
+	copySeedBtn.MouseButton1Click:Connect(function()
+		local s = appState.lastSeed:get()
+		if s <= 0 then
+			appState.generationMessage:set("Generate first to get a seed")
+			return
+		end
+		appState.seed:set(s) -- commit it (also updates the box text) so it persists
+		seedInput:CaptureFocus()
+		seedInput.CursorPosition = #seedInput.Text + 1
+		seedInput.SelectionStart = 1
+		appState.generationMessage:set("Seed " .. tostring(s) .. " selected — press Ctrl+C")
+	end)
+
+	-- Dim the button until there's a seed to copy.
+	appState.lastSeed:subscribe(function(s)
+		copySeedBtn.AutoButtonColor = s > 0
+		copySeedBtn.TextTransparency = if s > 0 then 0 else 0.5
 	end)
 
 	local serverDot = Instance.new("Frame")
@@ -887,8 +926,10 @@ local function buildUI()
 							appState.generationStatus:set("completed")
 							appState.duration:set(playbackSvc:getDuration())
 							-- Show the seed that was used (don't overwrite the input,
-							-- so seed=0 keeps generating fresh random results)
+							-- so seed=0 keeps generating fresh random results).
+							-- Stash it for the "Copy seed" button.
 							if resultData.seed then
+								appState.lastSeed:set(resultData.seed)
 								appState.generationMessage:set("Done (seed " .. tostring(resultData.seed) .. ")")
 							end
 						else
