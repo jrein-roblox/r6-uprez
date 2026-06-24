@@ -3,6 +3,10 @@
 Re-imagine Roblox R6/R15 animations as full-body R15 motion via Kimodo, or
 synthesize R15 animations from text prompts directly.
 
+> **Want the Studio plugin?** RoMotion lets you generate animations live inside
+> Roblox Studio from a text prompt + viewport constraints. See
+> [`ROMOTION.md`](ROMOTION.md) for plugin + server setup.
+
 ```
 asset id ──► extract_pose.lua  ──► pose.json
             (roblox-cli)
