@@ -236,6 +236,65 @@ def _trim_middle_cycle(result: dict, source_n_frames: int, loop_passes: int) -> 
     result["frameCount"] = end - start
 
 
+def _highpass_lower_torso(result: dict, sigma_frames: float) -> None:
+    """Strip slow drift from LowerTorso's Position curve, keeping fast sway.
+
+    Why this exists: Roblox's UGC validator caps how far ANY body part's
+    Position curve may travel from its t=0 value at 0.5 studs
+    (`UGCValidateBodyPartTranslationMaxDistanceHundredths` = 50, confirmed unset
+    in production so the default applies). It is the wall-clipping guard, and
+    unlike `CurveAnimPositionBounded` it does NOT exempt LowerTorso -- which is
+    exactly where `_fold_root_into_lower_torso` puts all of our root motion.
+
+    Every clip this pipeline had shipped violated it: v1 salsa measured
+    0.62-3.07 studs, latin_v3 up to 1.89.
+
+    The cap measures DRIFT, and drift is the component an in-place emote should
+    not have; the per-step hip sway that makes a dance read is fast motion. So
+    subtract a Gaussian-smoothed copy of the curve and keep the residual. At
+    sigma=5 frames (~0.17 s) the shipped clips drop to 0.21-0.37 studs while the
+    sway survives at full amplitude. Scaling the whole curve down instead would
+    flatten the dance.
+
+    Frame 0 is preserved as the anchor so the clip still starts where the fold
+    left it. Mutates `result` in place.
+    """
+    if sigma_frames <= 0:
+        return
+    lt = result.get("parts", {}).get("LowerTorso")
+    if not lt or "posX" not in lt:
+        return
+
+    import numpy as np
+
+    xyz = np.stack([np.asarray(lt["posX"], dtype=float),
+                    np.asarray(lt["posY"], dtype=float),
+                    np.asarray(lt["posZ"], dtype=float)], axis=1)
+    n = xyz.shape[0]
+    if n < 3:
+        return
+
+    radius = max(1, int(3 * sigma_frames))
+    k = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma_frames) ** 2)
+    k /= k.sum()
+    smooth = np.stack([
+        np.convolve(np.pad(xyz[:, i], radius, mode="edge"), k, mode="valid")
+        for i in range(3)
+    ], axis=1)
+
+    # Residual = fast component. Re-anchor so frame 0 is unchanged.
+    hp = xyz - smooth
+    hp = hp - hp[0] + xyz[0]
+
+    before = float(np.linalg.norm(xyz - xyz[0], axis=1).max())
+    after = float(np.linalg.norm(hp - hp[0], axis=1).max())
+    lt["posX"] = hp[:, 0].tolist()
+    lt["posY"] = hp[:, 1].tolist()
+    lt["posZ"] = hp[:, 2].tolist()
+    print(f"[pipeline] LowerTorso high-pass sigma={sigma_frames:g}: "
+          f"drift {before:.3f} -> {after:.3f} studs (UGC cap 0.5)")
+
+
 def _fold_root_into_lower_torso(result: dict) -> None:
     """Fold HRP motion into LowerTorso as a delta from frame 0, then DROP
     the HRP curves so Studio plays the animation at the character's spawn
@@ -330,6 +389,7 @@ def _retarget_bvh_to_r15_json(
     inertial_blend_frames: int = 0,
     hrp_scale: float | None = None,
     target_rig: str = "r15",
+    lower_torso_highpass_sigma: float = 0.0,
 ) -> dict:
     """Run the SOMA→R15 retarget. Mirrors batch_retarget._process_one.
 
@@ -372,6 +432,9 @@ def _retarget_bvh_to_r15_json(
         _trim_middle_cycle(result, source_n_frames, loop_passes)
     if not root_motion:
         _fold_root_into_lower_torso(result)
+        # After folding, before the seam blend: the blend should operate on
+        # the final curves that build_rbxm.lua emits.
+        _highpass_lower_torso(result, lower_torso_highpass_sigma)
     # Inertial blend last so it operates on the final per-curve arrays
     # that build_rbxm.lua actually emits — works for both root-motion and
     # folded-LT modes.

@@ -245,6 +245,7 @@ def _build_loop_constraints(
     n_frames: int,
     *,
     sample_frame: int = 0,
+    pin_root_every: int = 0,
 ) -> list[dict]:
     """Read pass-1 NPZ at `sample_frame` and emit constraints pinning that
     pose at both frame 0 and frame n_frames-1 of pass 2.
@@ -279,6 +280,15 @@ def _build_loop_constraints(
     used in earlier drafts of this helper introduced a 90° X-axis flip
     (BVH parent-frame convention != SOMASkeleton77's).
     """
+    # `pin_root_every` > 0 adds an extra root2d constraint sampled every N
+    # frames across the WHOLE clip, holding ground-plane XZ at the origin.
+    #
+    # Why: the loop constraints below only exist at frames 0 and n_frames-1, so
+    # the root is completely unconstrained for everything in between and the
+    # character is free to wander. Raising --loop-cfg-constraint-weight pushes
+    # harder on those two frames while the free middle just gets more energetic,
+    # which shows up as the dancer travelling several studs. For an in-place
+    # emote "stay on the spot" is true for every frame, so say so.
     import numpy as np
     from scipy.spatial.transform import Rotation as R
 
@@ -351,6 +361,18 @@ def _build_loop_constraints(
             "smooth_root_2d": smooth_root_2d.tolist(),
             "joint_names": [joint_name],
         })
+    if pin_root_every > 0:
+        dense = list(range(0, n_frames, max(1, int(pin_root_every))))
+        if dense[-1] != n_frames - 1:
+            dense.append(n_frames - 1)
+        constraints.append({
+            "type": "root2d",
+            "frame_indices": dense,
+            "smooth_root_2d": [[0.0, 0.0] for _ in dense],
+        })
+        print(f"[prompt_pipeline] pinning root XZ at origin across "
+              f"{len(dense)} frames (every {pin_root_every})")
+
     return constraints
 
 
@@ -507,6 +529,29 @@ def main(argv: list[str] | None = None) -> int:
                         f"{_LOOP_DEFAULT_INERTIAL_SECONDS:.2f}s; override "
                         "with --inertial-blend-seconds). Doubles the "
                         "kimodo wall-clock cost.")
+    p.add_argument("--pin-root-every", type=int, default=0,
+                   help="Add a root2d constraint every N frames holding "
+                        "ground-plane XZ at the origin for the whole clip. The "
+                        "loop constraints only cover frames 0 and F-1, leaving "
+                        "the root free in between, which is why the character "
+                        "wanders (and why raising the cfg weight makes it "
+                        "worse). Try 10. 0 disables.")
+    p.add_argument("--lower-torso-highpass-sigma", type=float, default=0.0,
+                   help="Gaussian sigma in frames for high-passing the "
+                        "LowerTorso Position curve, removing slow drift while "
+                        "keeping per-step sway. Roblox caps any part's Position "
+                        "drift from t=0 at 0.5 studs "
+                        "(UGCValidateBodyPartTranslationMaxDistanceHundredths); "
+                        "since root motion is folded into LowerTorso, every "
+                        "clip this pipeline shipped violated that (0.62-3.07 "
+                        "studs). sigma=5 brings them to 0.21-0.37.\n"
+                        "DEFAULT 0 (off): empirically that cap is NOT enforced "
+                        "on our upload path -- clips measuring 0.78-1.33 studs "
+                        "passed validation, consistent with "
+                        "CurveAnimPartsRotateOnlyIfBones skipping boneless "
+                        "EMOTE_ANIMATION uploads. Latin dances are also SUPPOSED "
+                        "to travel, and high-passing strips exactly that. Only "
+                        "enable if an upload actually fails on drift.")
     p.add_argument("--loop-cfg-constraint-weight", type=float, default=4.0,
                    help="When --loop is set, pass 2 is forced to "
                         "cfg_type=separated with this constraint weight "
@@ -524,6 +569,21 @@ def main(argv: list[str] | None = None) -> int:
                         "sampled frame is zeroed so pass 2 starts at the "
                         "origin regardless of how far the character had "
                         "drifted by then.")
+    p.add_argument("--loop-offset-mode", choices=["fixed", "auto"], default="fixed",
+                   help="How to choose the loop pivot frame. 'fixed' uses "
+                        "--loop-offset verbatim. 'auto' inspects the pass-1 "
+                        "NPZ and picks a frame that is genuinely mid-motion — "
+                        "furthest from the rest pose, at a representative "
+                        "speed. Use 'auto' for continuous motion like dances, "
+                        "where a fixed offset can still land in kimodo's idle "
+                        "ramp-in and make the loop open and close on a stand.")
+    p.add_argument("--loop-search-from", type=float, default=0.25,
+                   help="With --loop-offset-mode auto: start of the search "
+                        "window as a fraction of the clip (default 0.25, i.e. "
+                        "skip the first quarter where the ramp-in lives).")
+    p.add_argument("--loop-search-to", type=float, default=0.95,
+                   help="With --loop-offset-mode auto: end of the search "
+                        "window as a fraction of the clip (default 0.95).")
     p.add_argument("--ground-y-mode", choices=["first", "min", "off"],
                    default="first",
                    help="Shift the root-translation Y curve so the rest "
@@ -660,9 +720,29 @@ def main(argv: list[str] | None = None) -> int:
             # ~90° X-axis flip on the limbs.
             n_frames = int(round(total_duration_s * 30))
             pass1_npz = pass1_bvh.with_suffix(".npz")
-            sample_frame = int(round(args.loop_offset * 30))
+            pivot_diag: dict | None = None
+            if args.loop_offset_mode == "auto":
+                # Let the pass-1 motion choose the pivot. A fixed offset —
+                # even mid-duration — can still land in the idle ramp-in, and
+                # since the pivot pose is pinned at BOTH endpoints of pass 2,
+                # that makes the loop open and close on a stand.
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                import loop_quality as _lq
+                sample_frame, pivot_diag = _lq.pick_mid_motion_frame(
+                    pass1_npz,
+                    search_from=args.loop_search_from,
+                    search_to=args.loop_search_to,
+                )
+                print(f"[prompt_pipeline] auto loop pivot: frame "
+                      f"{sample_frame} (t={sample_frame / 30.0:.2f}s), "
+                      f"dist_from_rest="
+                      f"{pivot_diag.get('picked_dist_from_rest')} "
+                      f"(max {pivot_diag.get('max_dist_from_rest')})")
+            else:
+                sample_frame = int(round(args.loop_offset * 30))
             constraints = _build_loop_constraints(
                 pass1_npz, n_frames=n_frames, sample_frame=sample_frame,
+                pin_root_every=args.pin_root_every,
             )
             (clip_dir / "constraints.json").write_text(
                 json.dumps(constraints, indent=2)
@@ -687,6 +767,8 @@ def main(argv: list[str] | None = None) -> int:
                 "loop_pass1_npz": str(pass1_npz),
                 "loop_offset_s": float(args.loop_offset),
                 "loop_sample_frame": int(sample_frame),
+                "loop_offset_mode": args.loop_offset_mode,
+                "loop_pivot_diag": pivot_diag,
                 "loop_cfg_constraint_weight": float(
                     args.loop_cfg_constraint_weight
                 ),
@@ -793,6 +875,7 @@ def main(argv: list[str] | None = None) -> int:
             inertial_blend_frames=args.inertial_blend,
             hrp_scale=effective_hrp_scale,
             target_rig=args.target_rig,
+            lower_torso_highpass_sigma=args.lower_torso_highpass_sigma,
         )
         print(f"[prompt_pipeline] retarget OK (hrp_scale={effective_hrp_scale:.3f}): {info}")
         # Ground the rest pose. Done as a post-pass on the dumped JSON
