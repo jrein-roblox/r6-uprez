@@ -240,6 +240,70 @@ _KIMODO_FPS = 30
 _LOOP_DEFAULT_INERTIAL_FRAMES = int(round(_LOOP_DEFAULT_INERTIAL_SECONDS * _KIMODO_FPS))
 
 
+# CM_TO_STUD = 0.03, i.e. 1 cm = 0.03 studs, so 1 metre = 100 cm = 3 studs.
+# kimodo's root_positions are in metres; the Animate script's speeds are studs.
+_STUDS_PER_METRE = export_r15.CM_TO_STUD * 100.0   # == 3.0
+
+
+def _resolve_hrp_scale(args) -> float:
+    """The translation scale from SOMA proportions to the target rig.
+
+    Hoisted out of the retarget stage because the ground-speed constraint in
+    Stage A needs the same number: it converts an effective on-rig speed into
+    the SOMA-space displacement kimodo should produce. If the two stages
+    disagreed, the clip would come out scaled wrong.
+    """
+    if args.hrp_scale is not None:
+        return float(args.hrp_scale)
+    return args.target_hrp_to_ankle / _soma_bind_hip_to_ankle_studs()
+
+
+def _build_ground_speed_constraints(
+    n_frames: int,
+    target_studs_per_sec: float,
+    *,
+    every: int = 10,
+    fps: float = 30.0,
+    hrp_scale: float = 1.0,
+) -> list[dict]:
+    """Constrain the root to travel forward at a chosen ground speed.
+
+    This is the fix for foot skate. The Animate script cross-fades walk and run
+    assuming the clip travels 6.4 studs/s (walk) or 12.8 (run) per unit clip
+    time; a prompt like "a zombie shuffling" produces ~1.75 studs/s, so the
+    engine slides the character forward much faster than the feet imply.
+
+    Post-hoc time compression cannot close a gap that large -- key spacing must
+    stay above 1/70 * 0.85 s (`CurveAnimNumericalDataValid`), capping compression
+    at roughly 2.7x. Constraining the root during generation does close it: by
+    fixing BOTH the position and the time at a series of samples, the model is
+    told how far to travel by when, and it produces a gait at that speed rather
+    than a slow gait we then have to speed up.
+
+    Emits one `root2d` constraint sampled every `every` frames, with forward
+    (+Z, kimodo convention) displacement increasing linearly. Sampling the
+    interior rather than just the endpoints is what pins the speed PROFILE --
+    endpoints alone would allow the model to loiter and then rush.
+    """
+    frames = list(range(0, n_frames, max(1, int(every))))
+    if frames[-1] != n_frames - 1:
+        frames.append(n_frames - 1)
+    # `target_studs_per_sec` is the EFFECTIVE speed on the authored rig, which
+    # is what the Animate script's 6.4 / 12.8 figures mean. kimodo generates in
+    # SOMA proportions and the retarget then multiplies translation by
+    # `hrp_scale` (3.6693 / 2.643 = 1.388 for Rthro), so the constraint has to
+    # be divided by it or the clip comes out hrp_scale times too fast. Measured:
+    # requesting 6.4 without this correction produced 7.01 effective studs/s.
+    soma_studs_per_sec = target_studs_per_sec / (hrp_scale or 1.0)
+    metres_per_sec = soma_studs_per_sec / _STUDS_PER_METRE
+    xz = [[0.0, round(metres_per_sec * (f / fps), 6)] for f in frames]
+    return [{
+        "type": "root2d",
+        "frame_indices": frames,
+        "smooth_root_2d": xz,
+    }]
+
+
 def _build_loop_constraints(
     pass1_npz: Path,
     n_frames: int,
@@ -529,6 +593,37 @@ def main(argv: list[str] | None = None) -> int:
                         f"{_LOOP_DEFAULT_INERTIAL_SECONDS:.2f}s; override "
                         "with --inertial-blend-seconds). Doubles the "
                         "kimodo wall-clock cost.")
+    p.add_argument("--target-ground-speed", type=float, default=0.0,
+                   help="Studs/second of forward travel to pin the root to "
+                        "during generation. Use 6.4 for walk and 12.8 for run -- "
+                        "the speeds the Animate script cross-fades against. "
+                        "Fixes foot skate at its source; post-hoc time "
+                        "compression is capped near 2.7x by the key-spacing "
+                        "rule and cannot close a large gap. This is the "
+                        "EFFECTIVE speed on the authored rig -- it is divided "
+                        "by hrp_scale internally, since kimodo generates in SOMA "
+                        "proportions and the retarget scales translation by "
+                        "1.388 for Rthro. 0 disables.")
+    p.add_argument("--ground-speed-pin-every", type=int, default=10,
+                   help="Sample the root constraint every N frames. Pinning the "
+                        "interior (not just the endpoints) fixes the speed "
+                        "profile so the model cannot loiter then rush.")
+    p.add_argument("--root-mode", choices=["keep", "fold", "strip"], default=None,
+                   help="Root motion handling. 'fold' (emote default) folds the "
+                        "HRP delta into LowerTorso. 'strip' drops the root "
+                        "entirely -- REQUIRED for locomotion, since Roblox plays "
+                        "walk/run in place and moves the character itself. "
+                        "'keep' emits HRP curves (preview only).")
+    p.add_argument("--clip-loop", dest="clip_loop", action="store_true", default=None,
+                   help="Set AnimationClip.Loop = true. Required for every "
+                        "animation-pack slot except JumpAnimation "
+                        "(CurveAnimLoopingRequired).")
+    p.add_argument("--no-clip-loop", dest="clip_loop", action="store_false",
+                   help="Set AnimationClip.Loop = false (JumpAnimation only).")
+    p.add_argument("--clip-priority", type=str, default=None,
+                   help="AnimationClip.Priority, e.g. Core for pack slots. The "
+                        "Animate script forces Core at runtime anyway, but set "
+                        "it for other playback paths.")
     p.add_argument("--pin-root-every", type=int, default=0,
                    help="Add a root2d constraint every N frames holding "
                         "ground-plane XZ at the origin for the whole clip. The "
@@ -694,20 +789,56 @@ def main(argv: list[str] | None = None) -> int:
         else:  # nocfg
             cfg_weight = []
 
-        # Pass 1: prompt-only. Output named pass1 when looping so we keep
-        # the artifact for debugging side-by-side with pass 2.
-        pass1_out = _run_kimodo_promptonly(
-            clip_dir,
-            prompt=args.prompt,
-            duration=args.duration,
-            model=args.model,
-            seed=args.seed,
-            diffusion_steps=args.diffusion_steps,
-            cfg_type=args.cfg_type,
-            cfg_weight=cfg_weight,
-            num_transition_frames=args.num_transition_frames,
-            out_name=("generated_pass1" if args.loop else "generated"),
-        )
+        if args.target_ground_speed and args.target_ground_speed > 0:
+            # Constrained generation: pin the root's forward progress so the
+            # gait comes out at the speed Roblox will move the character at.
+            n_frames = int(round(total_duration_s * 30))
+            cons = _build_ground_speed_constraints(
+                n_frames, args.target_ground_speed,
+                every=args.ground_speed_pin_every,
+                hrp_scale=_resolve_hrp_scale(args))
+            (clip_dir / "constraints.json").write_text(json.dumps(cons, indent=2))
+            (clip_dir / "meta.json").write_text(json.dumps({
+                "source": "prompt+ground_speed",
+                "prompt": args.prompt,
+                "duration": args.duration,
+                "duration_s": total_duration_s,
+                "target_ground_speed_studs_per_sec": args.target_ground_speed,
+                "ground_speed_pin_every": args.ground_speed_pin_every,
+                "kimodo_model": args.model,
+                "kimodo_seed": args.seed,
+            }, indent=2))
+            total_m = args.target_ground_speed / _STUDS_PER_METRE * total_duration_s
+            print(f"[prompt_pipeline] root pinned to "
+                  f"{args.target_ground_speed:.2f} studs/s "
+                  f"({total_m:.2f} m over {total_duration_s:.1f}s, "
+                  f"{len(cons[0]['frame_indices'])} samples)")
+            run_kimodo.run_kimodo(
+                clip_dir,
+                prompt=args.prompt,
+                model=args.model,
+                seed=args.seed,
+                diffusion_steps=args.diffusion_steps,
+                out_name=("generated_pass1" if args.loop else "generated"),
+                duration_override=args.duration,
+            )
+            pass1_out = clip_dir / (
+                "generated_pass1.bvh" if args.loop else "generated.bvh")
+        else:
+          # Pass 1: prompt-only. Output named pass1 when looping so we keep
+          # the artifact for debugging side-by-side with pass 2.
+          pass1_out = _run_kimodo_promptonly(
+              clip_dir,
+              prompt=args.prompt,
+              duration=args.duration,
+              model=args.model,
+              seed=args.seed,
+              diffusion_steps=args.diffusion_steps,
+              cfg_type=args.cfg_type,
+              cfg_weight=cfg_weight,
+              num_transition_frames=args.num_transition_frames,
+              out_name=("generated_pass1" if args.loop else "generated"),
+          )
         pass1_bvh = pass1_out
 
         if args.loop:
@@ -856,13 +987,7 @@ def main(argv: list[str] | None = None) -> int:
         # ⇒ 1.388. For stock R15 override (1.6) ⇒ 0.605. We override
         # the historical 0.72 baseline (which was empirically tuned and
         # over-translated stock R15 by ~19%) in favor of geometry.
-        if args.hrp_scale is not None:
-            effective_hrp_scale = float(args.hrp_scale)
-        else:
-            soma_bind_chain_studs = _soma_bind_hip_to_ankle_studs()
-            effective_hrp_scale = (
-                args.target_hrp_to_ankle / soma_bind_chain_studs
-            )
+        effective_hrp_scale = _resolve_hrp_scale(args)
         info = parent_pipeline._retarget_bvh_to_r15_json(
             bvh_path, r15_json,
             root_motion=args.root_motion,
@@ -876,6 +1001,9 @@ def main(argv: list[str] | None = None) -> int:
             hrp_scale=effective_hrp_scale,
             target_rig=args.target_rig,
             lower_torso_highpass_sigma=args.lower_torso_highpass_sigma,
+            root_mode=args.root_mode,
+            loop=args.clip_loop,
+            priority=args.clip_priority,
         )
         print(f"[prompt_pipeline] retarget OK (hrp_scale={effective_hrp_scale:.3f}): {info}")
         # Ground the rest pose. Done as a post-pass on the dumped JSON

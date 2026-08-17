@@ -390,6 +390,9 @@ def _retarget_bvh_to_r15_json(
     hrp_scale: float | None = None,
     target_rig: str = "r15",
     lower_torso_highpass_sigma: float = 0.0,
+    root_mode: str | None = None,
+    loop: bool | None = None,
+    priority: str | None = None,
 ) -> dict:
     """Run the SOMA→R15 retarget. Mirrors batch_retarget._process_one.
 
@@ -430,7 +433,33 @@ def _retarget_bvh_to_r15_json(
     # the start of cycle 1.
     if loop_passes > 1 and source_n_frames >= 2:
         _trim_middle_cycle(result, source_n_frames, loop_passes)
-    if not root_motion:
+    if root_mode is None:
+        # Back-compat: callers still passing only `root_motion`.
+        root_mode = "keep" if root_motion else "fold"
+    if root_mode not in ("keep", "fold", "strip"):
+        raise ValueError(f"root_mode must be keep|fold|strip, got {root_mode!r}")
+    if loop is not None:
+        # CurveAnimLoopingRequired demands Loop == true for every ANIMATION-pack
+        # slot except JumpAnimation. build_rbxm.lua reads this field.
+        result["loop"] = bool(loop)
+    if priority is not None:
+        result["priority"] = str(priority)
+
+    # Root handling. Three modes:
+    #   keep   - emit HRP curves. The character translates itself while the
+    #            engine ALSO moves it, so only useful for previewing raw motion.
+    #   fold   - default for emotes: HRP delta folded into LowerTorso so the
+    #            body still sways but the HRP stays at spawn.
+    #   strip  - required for LOCOMOTION. Drop the root entirely without
+    #            folding, leaving LowerTorso holding only sway and bob. Roblox
+    #            plays walk/run in place and moves the character itself, so any
+    #            travel baked into the clip double-translates and also blows
+    #            `CurveAnimPartsRotateOnlyIfBones`' 0.5-stud cap -- which for the
+    #            ANIMATION upload category applies unconditionally and does NOT
+    #            exempt LowerTorso (unlike the EMOTE_ANIMATION path).
+    if root_mode == "strip":
+        result.pop("root", None)
+    elif root_mode == "fold":
         _fold_root_into_lower_torso(result)
         # After folding, before the seam blend: the blend should operate on
         # the final curves that build_rbxm.lua emits.

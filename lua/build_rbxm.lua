@@ -243,6 +243,25 @@ local function buildCurveAnimation(data: any, clipName: string): Instance
 	local ca = Instance.new("CurveAnimation")
 	ca.Name = clipName
 
+	-- Loop / Priority come from r15.json when present. Required for animation
+	-- packs: `CurveAnimLoopingRequired` fails any ANIMATION-category upload
+	-- whose Loop is false, exempting only JumpAnimation. Emotes leave both
+	-- fields absent and keep the engine defaults, which is why this was never
+	-- set before.
+	if data.loop ~= nil then
+		(ca :: any).Loop = data.loop and true or false
+	end
+	if data.priority ~= nil then
+		local ok, enumVal = pcall(function()
+			return (Enum.AnimationPriority :: any)[data.priority]
+		end)
+		if ok and enumVal then
+			(ca :: any).Priority = enumVal
+		else
+			warn(string.format("[build_rbxm] unknown AnimationPriority %q", tostring(data.priority)))
+		end
+	end
+
 	-- Embed rig metadata at the root so downstream retargeting tooling can
 	-- resolve curve names to live joints. We clone the cached template
 	-- because each CurveAnimation needs its own copy.
