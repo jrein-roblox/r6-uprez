@@ -291,7 +291,9 @@ def detect_idle_window(
     max_sec: float = 4.0,
     skip_head_frac: float = 0.15,
     min_energy: float = 0.60,
+    max_energy: float = 1e9,
     min_rest_collapse: float = 0.50,
+    min_pose_offset: float = 0.06,
     energy_frac_of_best: float = 0.60,
     max_drift: float = 0.45,
 ) -> tuple[int, int] | None:
@@ -365,14 +367,24 @@ def detect_idle_window(
     for start in range(lo, max(lo + 1, t - min_len - 1)):
         e = float(speed[start:start + min_len].mean())
         best_energy = max(best_energy, e)
-    energy_floor = max(min_energy, energy_frac_of_best * best_energy)
+    # The relative floor exists to stop the search picking the still parts of a
+    # lively clip. But when a CEILING is set explicitly the caller is asking for
+    # a calm window on purpose, and the relative floor would veto exactly what
+    # they asked for -- 60% of a 0.5 best window is 0.3, which rejects
+    # everything under it. So an explicit ceiling disables the relative floor and
+    # `min_energy` alone guards against a frozen window.
+    if max_energy < 1e8:
+        energy_floor = min_energy
+    else:
+        energy_floor = max(min_energy, energy_frac_of_best * best_energy)
 
     best = None
     rejected_energy = rejected_rest = rejected_drift = 0
     for start in range(lo, t - min_len - 1):
         for length in range(min_len, min(max_len, t - 1 - start) + 1):
             end = start + length
-            if float(speed[start:end].mean()) < energy_floor:
+            win_energy = float(speed[start:end].mean())
+            if win_energy < energy_floor or win_energy > max_energy:
                 rejected_energy += 1
                 continue
             if lt_xyz is not None and end < lt_xyz.shape[0]:
@@ -382,6 +394,16 @@ def detect_idle_window(
                     continue
             seg = dist_rest[start:end + 1]
             med = float(np.median(seg))
+            # ABSOLUTE distance from the bind pose. `rest_collapse` below is a
+            # RATIO of min to median within the window, so a window sitting
+            # uniformly close to bind still scores high on it -- which is how a
+            # 0.05-energy window with rest_collapse 0.80 got shipped as an idle
+            # that read as "standing at bind with a little movement". Measured
+            # median distance for that window was 0.012; a window that reads as a
+            # held dance pose is 0.08+. This is the filter that catches it.
+            if med < min_pose_offset:
+                rejected_rest += 1
+                continue
             if med <= 1e-9 or float(seg.min() / med) < min_rest_collapse:
                 rejected_rest += 1
                 continue
@@ -425,6 +447,121 @@ def slice_cycle(r15: dict, start: int, length: int) -> dict:
             set_part_pos(root, p[start:end + 1])
     out["frameCount"] = length + 1
     return out
+
+
+def _inertial_decay(n: int, x0: np.ndarray, v0: np.ndarray) -> np.ndarray:
+    """Inertialization decay curve (Bollo 2018), shape (n, D).
+
+    True inertial blending, as distinct from the smoothstep offset-decay both
+    `blend_seam` and `pipeline._inertial_blend_loop_seam` used to do. Those match
+    POSITION at the seam and ignore velocity, so a slow clip whose two ends are
+    moving differently still changes direction abruptly -- visible as the hitch
+    in a graceful idle, where the seam velocity mismatch measured 0.43-0.53.
+
+    Solves a quintic in the offset so that at the end of the blend the offset,
+    its velocity, AND its acceleration are all zero:
+
+        x(t) = A/2 t^5 + B t^4 + C t^3 + v0 t + x0
+        x(T) = x'(T) = x''(T) = 0
+
+    Carrying v0 is the whole point: the blend leaves the seam moving the way the
+    previous frame was moving, then eases that away, instead of teleporting the
+    pose and letting velocity jump.
+    """
+    # T = n-1, NOT n. The decay is APPLIED to frames 0..n-1, so it has to reach
+    # zero at index n-1 -- if it only reaches zero at index n, the last blended
+    # frame still carries a residual offset while frame n carries none, and that
+    # step is a discontinuity. It cost a 200 studs/s spike at exactly the blend
+    # boundary (t=0.46s for a 14-frame blend) against the 45 limit.
+    T = float(max(1, n - 1))
+    t = np.arange(n, dtype=float)
+    x0 = np.asarray(x0, dtype=float).reshape(-1)
+    v0 = np.asarray(v0, dtype=float).reshape(-1)
+
+    # Solve A, B, C as a 3x3 system rather than by hand. TWO separate
+    # hand-derived closed forms were wrong here in ways that still looked
+    # plausible -- x(T) came out 0 while x'(T) and x''(T) did not -- so the
+    # blend never actually landed smoothly. The system is tiny; solve it.
+    #
+    #   x(t) = A/2 t^5 + B t^4 + C t^3 + v0 t + x0
+    #   x(T) = 0,  x'(T) = 0,  x''(T) = 0
+    M = np.array([
+        [T ** 5 / 2.0,       T ** 4,        T ** 3],
+        [5.0 * T ** 4 / 2.0, 4.0 * T ** 3,  3.0 * T ** 2],
+        [10.0 * T ** 3,      12.0 * T ** 2, 6.0 * T],
+    ])
+    out = np.empty((n, x0.shape[0]))
+    for d in range(x0.shape[0]):
+        A, B, C = np.linalg.solve(
+            M, np.array([-(v0[d] * T + x0[d]), -v0[d], 0.0]))
+        out[:, d] = (A / 2.0 * t ** 5 + B * t ** 4 + C * t ** 3
+                     + v0[d] * t + x0[d])
+    return out
+
+
+def _quat_log(q: np.ndarray) -> np.ndarray:
+    """Rotation -> axis*angle (3-vector), the linear space to blend rotations in."""
+    q = q / (np.linalg.norm(q) or 1.0)
+    if q[3] < 0.0:
+        q = -q
+    v = q[:3]
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return np.zeros(3)
+    return v / n * (2.0 * math.atan2(n, float(q[3])))
+
+
+def _quat_exp(w: np.ndarray) -> np.ndarray:
+    """axis*angle -> quaternion (x, y, z, w)."""
+    ang = float(np.linalg.norm(w))
+    if ang < 1e-9:
+        return np.array([0.0, 0.0, 0.0, 1.0])
+    ax = w / ang
+    s = math.sin(ang / 2.0)
+    return np.array([ax[0] * s, ax[1] * s, ax[2] * s, math.cos(ang / 2.0)])
+
+
+def blend_seam_inertial(r15: dict, blend_frames: int = 8) -> None:
+    """Close the loop seam with true inertialization.
+
+    For each curve: measure the offset from frame 0 to the last frame, and the
+    RATE that offset is changing, then decay both to zero across `blend_frames`
+    with `_inertial_decay`. Rotations are handled in axis-angle log space so the
+    quintic operates on a linear quantity.
+
+    Longer blends suit slower motion -- a graceful idle needs more frames to
+    absorb the same mismatch than a fast dance does, which is why idles get
+    their own `--idle-blend-frames`.
+    """
+    n = r15["frameCount"]
+    if blend_frames <= 1 or n < blend_frames + 3:
+        return
+
+    for part in r15["parts"].values():
+        q = part_quats(part)
+        if q is not None:
+            # offset that takes frame 0 to the last frame, in log space
+            off0 = _quat_log(_qmul(q[-1], _quat_conj(q[0])))
+            # how fast that offset is changing across the seam
+            off1 = _quat_log(_qmul(q[-2], _quat_conj(q[1])))
+            v0 = off1 - off0
+            dec = _inertial_decay(blend_frames, off0, v0)
+            for i in range(blend_frames):
+                q[i] = _qmul(_quat_exp(dec[i]), q[i])
+            set_part_quats(part, q)
+
+        p = part_pos(part)
+        if p is not None:
+            off0 = p[-1] - p[0]
+            off1 = p[-2] - p[1]
+            v0 = off1 - off0
+            dec = _inertial_decay(blend_frames, off0, v0)
+            p[:blend_frames] = p[:blend_frames] + dec
+            set_part_pos(part, p)
+
+
+def _quat_conj(q: np.ndarray) -> np.ndarray:
+    return np.array([-q[0], -q[1], -q[2], q[3]])
 
 
 def blend_seam(r15: dict, blend_frames: int = 4) -> None:
@@ -664,7 +801,7 @@ def _cmd_build(args) -> int:
         if cy is None:
             raise SystemExit(f"no usable cycle in {clip_name}")
         cut = slice_cycle(r15, cy.start, cy.length)
-        blend_seam(cut, blend_frames=args.blend_frames)
+        blend_seam_inertial(cut, blend_frames=args.blend_frames)
         built[slot] = cut
         print(f"[pack] {slot:<9} <- {clip_name} frames {cy.start}..{cy.end} "
               f"({cy.length / FPS:.2f}s) seam={cy.seam_pos:.3f} "
@@ -696,16 +833,32 @@ def _cmd_build(args) -> int:
         r15, d = load(clip_name)
         # Search for a window whose endpoints already agree, rather than
         # slicing arbitrarily and forcing them together with the blend.
+        # idle1 can be capped calmer than idle2: the two play weighted 5/10, and
+        # a busy primary idle reads as distracting for a slow, elegant style.
+        cap = (args.idle_max_energy if slot == "idle"
+               else args.idle2_max_energy or args.idle_max_energy)
         win = detect_idle_window(d, min_sec=args.idle_min_seconds,
-                                 max_sec=args.idle_seconds)
+                                 max_sec=args.idle_seconds,
+                                 min_energy=args.idle_min_energy,
+                                 max_energy=cap,
+                                 min_pose_offset=args.idle_min_pose_offset)
         if win is None:
+            # Falling back to an arbitrary window reintroduces exactly the bug
+            # the search exists to prevent: blend_seam force-closes mismatched
+            # endpoints over 4 frames, which reads as "dances, then snaps to
+            # bind pose". Say so loudly rather than shipping it quietly.
             n = r15["frameCount"]
             start = int(0.25 * n)
             length = min(int(args.idle_seconds * FPS), n - start - 1)
+            print(f"[pack] ** WARNING {slot}: no window passed the motion "
+                  f"filters, falling back to an ARBITRARY {length / FPS:.1f}s "
+                  f"window. This idle will likely snap to bind pose at the "
+                  f"seam. Regenerate the idle with a prompt that says "
+                  f"'dancing' rather than 'standing'.")
         else:
             start, length = win
         cut = slice_cycle(r15, start, length)
-        blend_seam(cut, blend_frames=args.blend_frames)
+        blend_seam_inertial(cut, blend_frames=args.idle_blend_frames)
         if slot == "idle2" and args.idle2 is None:
             # Only one idle generated: make the second a slower variant so the
             # weighted pair does not look like the same clip twice.
@@ -821,10 +974,43 @@ def main(argv: list[str] | None = None) -> int:
                         "rate; 'min' speeds both up and worsens skate.")
     b.add_argument("--idle-seconds", type=float, default=3.0,
                    help="Longest idle window to consider.")
+    b.add_argument("--idle-blend-frames", type=int, default=10,
+                   help="Seam blend length for idles, in frames. Idles use TRUE "
+                        "inertialization (velocity-aware quintic decay), not the "
+                        "smoothstep offset decay the locomotion slots use, "
+                        "because slow motion needs velocity continuity to avoid "
+                        "an abrupt direction change at the seam. Slower styles "
+                        "want longer: 10 frames is a third of a second.")
+    b.add_argument("--idle-min-pose-offset", type=float, default=0.06,
+                   help="Minimum MEDIAN absolute distance from the bind pose "
+                        "over the idle window. rest_collapse is a ratio and "
+                        "cannot see this: a window hugging bind still scores 0.80. "
+                        "Measured -- 0.012 reads as standing at bind, 0.08 reads "
+                        "as a held dance pose, 0.15 is a full dance pose.")
+    b.add_argument("--idle-max-energy", type=float, default=1e9,
+                   help="Energy CEILING for the primary idle window. A busy idle "
+                        "is distracting for a slow style -- cap it to force a "
+                        "calmer window. Reference: elegant catwalk windows run "
+                        "0.35-0.50, salsa/hip-hop 1.0-1.7.")
+    b.add_argument("--idle2-max-energy", type=float, default=None,
+                   help="Separate ceiling for idle2, so the pair can be calm + "
+                        "livelier rather than two of the same.")
+    b.add_argument("--idle-min-energy", type=float, default=0.60,
+                   help="Absolute energy floor for an idle window. 0.60 was "
+                        "calibrated on salsa and hip-hop, which are energetic "
+                        "styles (0.93-0.98 whole-clip). A graceful style is "
+                        "genuinely quieter -- an elegant catwalk idle measures "
+                        "0.22-0.38 -- so lower this per style (~0.35). The "
+                        "relative floor (60% of the clip's own liveliest "
+                        "window) is the style-independent guard and still "
+                        "prevents picking the static parts.")
     b.add_argument("--idle-min-seconds", type=float, default=1.5,
                    help="Shortest idle window to consider. The search picks the "
                         "window in [min, max] whose endpoints already match.")
-    b.add_argument("--blend-frames", type=int, default=4)
+    b.add_argument("--blend-frames", type=int, default=6,
+                   help="Seam blend length for locomotion slots, in frames. "
+                        "Inertial (velocity-aware) like the idles; raised from 4 "
+                        "since the old smoothstep decay only matched position.")
     b.add_argument("--min-len", type=int, default=20)
     b.add_argument("--max-len", type=int, default=90)
     b.set_defaults(func=_cmd_build)

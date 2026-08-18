@@ -15,6 +15,9 @@ local FileSystemService = game:GetService("FileSystemService")
 local INPUT_DIR: string = (_G :: any).MERGE_INPUT_DIR or error("MERGE_INPUT_DIR required")
 local OUTPUT_PATH: string = (_G :: any).MERGE_OUTPUT_PATH or error("MERGE_OUTPUT_PATH required")
 local LIMIT_STR: string? = (_G :: any).MERGE_LIMIT
+-- Name the container after the pack/emote set rather than a hardcoded
+-- "UGC_Emotes", so an imported rbxm says what it actually is.
+local ROOT_NAME: string = (_G :: any).MERGE_ROOT_NAME or "UGC_Emotes"
 local LIMIT: number? = LIMIT_STR and tonumber(LIMIT_STR) or nil
 
 print(string.format("[merge_rbxm] input=%s output=%s limit=%s", INPUT_DIR, OUTPUT_PATH, tostring(LIMIT)))
@@ -41,7 +44,7 @@ print(string.format("[merge_rbxm] found %d rbxm files", #rbxmFiles))
 
 -- Load each rbxm and collect CurveAnimations into a single Folder
 local root = Instance.new("Folder")
-root.Name = "UGC_Emotes"
+root.Name = ROOT_NAME
 
 local nameCount: { [string]: number } = {}
 

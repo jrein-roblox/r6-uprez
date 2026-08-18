@@ -26,6 +26,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="Output .rbxm path (default: <input>/all_emotes.rbxm)")
     p.add_argument("--roblox-cli", type=str, default=None,
                    help="Path to roblox-cli")
+    p.add_argument("--name", type=str, default=None,
+                   help="Name for the container Folder inside the rbxm. "
+                        "Defaults to the output file's stem, so a pack imports "
+                        "as e.g. 'catwalk_pack' instead of 'UGC_Emotes'.")
     p.add_argument("--limit", type=int, default=None,
                    help="Max clips to include")
     args = p.parse_args(argv)
@@ -41,6 +45,8 @@ def main(argv: list[str] | None = None) -> int:
         f"MERGE_INPUT_DIR={input_dir}",
         f"MERGE_OUTPUT_PATH={output_path}",
     ]
+    root_name = args.name or output_path.stem
+    globals_args.append(f"MERGE_ROOT_NAME={root_name}")
     if args.limit:
         globals_args.append(f"MERGE_LIMIT={args.limit}")
 
