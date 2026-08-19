@@ -379,13 +379,16 @@ def detect_idle_window(
         energy_floor = max(min_energy, energy_frac_of_best * best_energy)
 
     best = None
-    rejected_energy = rejected_rest = rejected_drift = 0
+    rejected_low = rejected_high = rejected_rest = rejected_drift = 0
     for start in range(lo, t - min_len - 1):
         for length in range(min_len, min(max_len, t - 1 - start) + 1):
             end = start + length
             win_energy = float(speed[start:end].mean())
-            if win_energy < energy_floor or win_energy > max_energy:
-                rejected_energy += 1
+            if win_energy < energy_floor:
+                rejected_low += 1
+                continue
+            if win_energy > max_energy:
+                rejected_high += 1
                 continue
             if lt_xyz is not None and end < lt_xyz.shape[0]:
                 seg_lt = lt_xyz[start:end + 1]
@@ -415,10 +418,17 @@ def detect_idle_window(
                 best = (cost, start, length, dp, dv,
                         float(speed[start:end].mean()), float(seg.min() / med))
     if best is None:
+        # Distinguish the two energy rejections. Conflating them printed
+        # "too static" for windows that were actually too ENERGETIC for an
+        # explicit ceiling, which sent debugging the wrong way entirely.
         print(f"[pack] no idle window passed the filters "
-              f"(energy>={energy_floor:.2f}, rest_collapse>={min_rest_collapse:.2f}, "
-              f"drift<={max_drift:.2f}; {rejected_energy} too static, "
-              f"{rejected_rest} passed through bind, {rejected_drift} over drift)")
+              f"(energy in [{energy_floor:.2f}, {max_energy:.2f}], "
+              f"pose_offset>={min_pose_offset:.2f}, "
+              f"rest_collapse>={min_rest_collapse:.2f}, drift<={max_drift:.2f})\n"
+              f"       rejected: {rejected_low} BELOW energy floor, "
+              f"{rejected_high} ABOVE energy ceiling, "
+              f"{rejected_rest} too near bind / collapsed, "
+              f"{rejected_drift} over drift")
         return None
     _, start, length, dp, dv, en, rc = best
     print(f"[pack] idle window {start}..{start + length} ({length / FPS:.2f}s) "
